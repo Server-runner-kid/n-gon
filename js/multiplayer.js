@@ -1,5 +1,5 @@
 /*
- * n-gon multiplayer v8.1  (permission-based joins/invites + UI polish; v6 + support for the newer n-gon: training, checkpoints, level editor/pool, local levels)
+ * n-gon multiplayer v9-B  (v9-A + ordered/stale-proof player snapshots, per-level validation; elimination + revival; permission-based joins)
  *
  * Design
  *  - Every client runs its OWN player, guns, techs and fields with the game's normal code.
@@ -72,6 +72,7 @@
     const now = () => performance.now();
     const log = (...a) => { if (DEBUG) console.log('[MP]', ...a); };
     function lerpAngle(a, b2, t) { let d = b2 - a; while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; return a + d * t; }
+    const stepMs = () => (typeof simulation !== 'undefined' && Number.isFinite(simulation.fpsInterval) && simulation.fpsInterval > 0) ? simulation.fpsInterval : 1000 / 72;
     function sample(buf, t) {
         const n = buf.length; if (!n) return null;
         if (t <= buf[0].t) return buf[0];
@@ -82,7 +83,7 @@
                 return { x: A.x + (B.x - A.x) * k, y: A.y + (B.y - A.y) * k, vx: B.vx, vy: B.vy, a: lerpAngle(A.a, B.a, k) };
             }
         }
-        const L = buf[n - 1]; const fr = Math.max(0, Math.min(8, (t - L.t) / 16.7));
+        const L = buf[n - 1]; const fr = Math.max(0, Math.min(8, (t - L.t) / stepMs()));
         return { x: L.x + L.vx * fr, y: L.y + L.vy * fr, vx: L.vx, vy: L.vy, a: L.a };
     }
 
@@ -143,6 +144,7 @@
             catchTarget: -1, catchRunning: false,
             runSeed: null, remotePending: false,
             paused: false, pausedAt: 0, stuck: 0, lastCycle: -1, hostCy: null,
+            epoch: (crypto.getRandomValues(new Uint32Array(1))[0]).toString(36), sendSeq: 0, dead: false, deadLc: -1, deadAt: 0, revivedLc: -1, revAuth: -1, forceDeath: false, reviveTimer: null,
             buttons: [], buttonSeq: 0, buttonSent: new Map(), remoteButtons: new Map(),
             buildingLevel: false, lastRosterAt: 0, lastButtonSnapshotAt: 0,
             solo: false, savePending: false, saveStarted: false, saveWatching: false, olWarned: -1, forceLv: null, forceFlip: null,
@@ -485,7 +487,7 @@
                 try { cur.close(); } catch (e) { }
             }
             p[slot] = c;
-            c.on('data', d => { onDataSafe(p, d); });
+            c.on('data', d => { if (p[slot] !== c || S.peers.get(pid) !== p) return; onDataSafe(p, d); });   // stale / replaced connection or removed peer
             c.on('close', () => { if (S.tearing) return; if (p[slot] === c) { p[slot] = null; if (slot === 'ev') dropPeer(p); } });
             c.on('error', () => {
                 if (S.tearing || p[slot] !== c) return;
@@ -533,7 +535,7 @@
         const hasPeers = () => { for (const p of S.peers.values()) if (p.ev && p.ev.open) return true; return false; };
 
         function sendHello(p) {
-            sendEv({ t: 'hello', name: S.name, hostId: (S.sessionHostId || S.hostId || S.id), seed: S.inGame ? (S.runSeed != null ? S.runSeed : getSeed()) : getSeed(), inGame: S.inGame && !S.solo, lc: LC(), pvp: S.pvp, peers: [...S.peers.keys()], ...(S.inGame && !S.solo ? lvInfo() : {}) }, p.id);
+            sendEv({ t: 'hello', name: S.name, hostId: (S.sessionHostId || S.hostId || S.id), seed: S.inGame ? (S.runSeed != null ? S.runSeed : getSeed()) : getSeed(), inGame: S.inGame && !S.solo, lc: LC(), pvp: S.pvp, dead: S.dead, ep: S.epoch, peers: [...S.peers.keys()], ...(S.inGame && !S.solo ? lvInfo() : {}) }, p.id);
             refreshRole();
         }
 
@@ -595,7 +597,8 @@
         const onDataSafe = guard('net.data', onData);
 
         H.hello = (p, d) => {
-            p.name = String(d.name || 'player').slice(0, 20); p.hello = true; p.pvp = d.pvp !== false; p.seenAt = now();
+            p.name = String(d.name || 'player').slice(0, 20); p.hello = true; p.pvp = d.pvp !== false; p.seenAt = now(); p.dead = d.dead === true;
+            if (typeof d.ep === 'string' && d.ep !== p.ep) { p.ep = d.ep; p.lastSeq = -1; p.offMin = null; p.buf = []; }
             if (!S.inGame && d.hostId && (p.id === S.sessionHostId || !S.sessionHostId)) { S.sessionHostId = String(d.hostId); S.hostId = S.sessionHostId; }
             // Peer connections are now permission-based; never auto-connect from a peer roster.
             if (d.inGame && !S.inGame && !S.loading && !S.starting) {          // they are already in a run: join it (whoever has the smaller id), then catch up
@@ -628,6 +631,14 @@
             ui.refresh();
         };
         H.peers = () => {}; // legacy roster packets cannot bypass join approval
+        H.dead = (p, d) => { if (S.peers.has(p.id)) { p.dead = true; p.alive = false; } };
+        H.revived = (p, d) => { if (S.peers.has(p.id)) { p.dead = false; p.alive = true; } };
+        H.rev = (p, d) => {              // the host revives eliminated players when a level begins
+            if (!isHostPeer(p) || S.solo || !Number.isFinite(Number(d.lc)) || !Array.isArray(d.ids)) return;
+            if (!d.ids.includes(S.id)) return;
+            S.revAuth = Math.max(S.revAuth, d.lc | 0);
+            tryRevive();
+        };
         H.seed = (p, d) => { if (isHostPeer(p) && !S.inGame && d.seed != null) setSeed(String(d.seed)); };
         // Only the deterministic lobby leader may start a shared run.
         H.startReq = (p) => {
@@ -817,17 +828,33 @@
         };
         H.s = (p, d) => {
             if (!Number.isInteger(d.lc) || d.lc < 0) return;
-            p.lc = d.lc; p.seenAt = now();
+            // ---- ordering: drop duplicates / packets that arrive late on the unreliable channel; a new epoch (peer restarted) resets it
+            if (typeof d.ep === 'string' && d.ep !== p.ep) { p.ep = d.ep; p.lastSeq = -1; p.offMin = null; p.buf = []; }
+            if (Number.isInteger(d.sq)) { if (d.sq <= p.lastSeq) return; p.lastSeq = d.sq; }
+            const recv = now();
+            // ---- level: when a peer changes level, everything we hold from its previous level is void
+            if (p.lc !== d.lc) { p.buf = []; p.bl = null; p.blAt = 0; p.cur = null; p.lastRecvT = 0; }
+            p.lc = d.lc; p.seenAt = recv;
+            // ---- clock offset: place each sample at the SENDER's time so bursts (tab was throttled, network jitter) don't play back fast
+            let st = recv;
+            if (Number.isFinite(d.ts)) {
+                const diff = recv - d.ts;
+                p.offMin = (p.offMin == null) ? diff : Math.min(p.offMin + 0.5, diff);      // follows the fastest path, slowly lets go of old minima
+                st = d.ts + p.offMin;
+                st = Math.min(st, recv);
+                if (p.lastRecvT && st <= p.lastRecvT) st = p.lastRecvT + 0.1;
+                p.lastRecvT = st;
+            }
             const a = d.p;
             if (Array.isArray(a) && a.length >= 16 && a.slice(0, 16).every(Number.isFinite)) {
                 const wasPaused = p.paused;
-                p.alive = !!a[5]; p.pvp = !!a[12]; p.hp = a[10] / 1000; p.mhp = a[11] / 1000; p.og = !!a[13]; p.yOff = a[14]; p.paused = !!a[15];
+                p.alive = !!a[5]; p.pvp = !!a[12]; p.mhp = Math.max(0.0001, Math.min(1e6, a[11] / 1000)); p.hp = Math.max(0, Math.min(p.mhp, a[10] / 1000)); p.og = !!a[13]; p.yOff = a[14]; p.paused = !!a[15]; p.dead = a[16] === 1;
                 if (p.paused && !wasPaused) p.pausedAt = now();
-                p.buf.push({ t: now(), x: a[0], y: a[1], vx: a[2] / 100, vy: a[3] / 100, a: a[4] / 1000 });
+                p.buf.push({ t: st, x: a[0], y: a[1], vx: a[2] / 100, vy: a[3] / 100, a: a[4] / 1000 });
                 if (p.buf.length > 10) p.buf.shift();
             }
             // Bullet snapshots are visual-only. Reject malformed/oversized arrays before drawing.
-            p.bl = Array.isArray(d.bl) ? d.bl.slice(0, CFG.maxBullets * 8).map(v => Number.isFinite(v) ? v : 0) : null;
+            p.bl = (d.lc === LC() && Array.isArray(d.bl)) ? d.bl.slice(0, CFG.maxBullets * 8).map(v => Number.isFinite(v) ? v : 0) : null;
             if (p.bl && p.bl.length % 8) p.bl.length -= p.bl.length % 8;
             p.blAt = now();
             const fromHost = isHostPeer(p);
@@ -857,6 +884,123 @@
             } catch (e) { }
             const stamp = Date.now().toString(36) + ':' + (performance.now() * 1000 | 0).toString(36) + ':' + S.id;
             return String(Math.abs(typeof Math.hash === 'function' ? Math.hash(stamp) : stamp.split('').reduce((h, c) => (h * 31 + c.charCodeAt(0)) | 0, 0)));
+        }
+        // ------------------------------------------------------------------ elimination, spectating and revival
+        // A player who "dies" while others are still alive is ELIMINATED instead of ending the run for everybody:
+        // they stay connected, keep every weapon/tech/field/pickup (we never run n-gon's real death code, which would wipe the
+        // run), cannot be hurt or hurt anyone, and spectate a living teammate. When the host's next level begins, the host
+        // revives them (message 'rev'); each player is revived at most once per level. The run only really ends when the last
+        // living player dies, then everybody's normal n-gon death runs.
+        function livingOthers() {
+            const r = [];
+            for (const p of S.peers.values()) if (p.ev && p.ev.open && p.hello && p.alive && !p.dead) r.push(p);
+            return r;
+        }
+        function canEliminate() {
+            if (S.forceDeath || S.dead || !S.together || !S.inGame || S.solo || S.loading || !hasPeers()) return false;
+            if (typeof levelEditor !== 'undefined' && levelEditor && levelEditor.isActive) return false;
+            if (simulation.isTraining || !m.alive) return false;
+            if (tech.isImmortal || (tech.isEigenstate && m.eigen && m.eigen.deathCount === 0)) return false;   // n-gon's own second chances run first
+            return livingOthers().length > 0;
+        }
+        function wrapDeath() {
+            wrapFn(m, 'death', 'm.death', orig => function () {
+                if (S.dead && !S.forceDeath) return undefined;                    // already eliminated; stray damage must not end the run
+                let elim = false;
+                try { elim = canEliminate(); } catch (e) { elim = false; }
+                if (elim) { eliminate(); return undefined; }
+                if (S.dead) { S.dead = false; }
+                return orig.apply(this, arguments);
+            });
+            wrapFn(m, 'takeDamage', 'm.takeDamage', orig => function () { if (S.dead) return undefined; return orig.apply(this, arguments); });
+            // an eliminated player cannot advance the level by standing in the exit
+            wrapFn(level, 'nextLevel', 'level.nextLevel', orig => function () {
+                if (S.dead && !S.applying && !S.remotePending && !S.forceDeath) return undefined;
+                return orig.apply(this, arguments);
+            });
+        }
+        function eliminate() {
+            S.dead = true; S.deadLc = LC(); S.deadAt = now(); S.revAuth = Math.min(S.revAuth, S.deadLc);
+            if (S.reviveTimer) { clearTimeout(S.reviveTimer); S.reviveTimer = null; }
+            try { m.drop(); } catch (e) { }
+            m.health = 0.001; try { m.displayHealth(); } catch (e) { }
+            m.immuneCycle = m.cycle + 1e9;
+            try { input.fire = false; input.field = false; } catch (e) { }
+            ui.banner('ELIMINATED — spectating. You come back at the start of the next level with everything you had.');
+            say('you were eliminated — you will be revived when the next level begins');
+            sendEv({ t: 'dead', lc: LC() });
+        }
+        function resetDead() {
+            if (S.reviveTimer) { clearTimeout(S.reviveTimer); S.reviveTimer = null; }
+            S.dead = false; S.deadLc = -1; S.revivedLc = -1; S.revAuth = -1; S.forceDeath = false;
+            try { ui.banner(null); } catch (e) { }
+        }
+        function revive() {
+            if (!S.dead) return;
+            S.dead = false; S.revivedLc = LC();
+            if (S.reviveTimer) { clearTimeout(S.reviveTimer); S.reviveTimer = null; }
+            // nothing else is touched: weapons, techs, field, field upgrades, pickups and research stay as they were
+            try { m.health = m.maxHealth; if (typeof m.maxEnergy === 'number') m.energy = Math.max(m.energy || 0, m.maxEnergy); m.displayHealth(); } catch (e) { }
+            m.immuneCycle = m.cycle + 180;                                      // 2.5 s of grace
+            // valid spawn: use the level's spawn point if the current position is missing, not finite or inside the map
+            try {
+                const bad = !m.pos || !Number.isFinite(m.pos.x) || !Number.isFinite(m.pos.y) || (typeof m.isInsideMap === 'function' && m.isInsideMap());
+                if (bad && m.spawnPos && Number.isFinite(m.spawnPos.x) && Number.isFinite(m.spawnPos.y)) {
+                    Matter.Body.setPosition(player, { x: m.spawnPos.x, y: m.spawnPos.y });
+                    m.pos.x = m.spawnPos.x; m.pos.y = m.spawnPos.y;
+                }
+                Matter.Body.setVelocity(player, { x: 0, y: 0 });
+            } catch (e) { }
+            ui.banner(null);
+            say('you were revived');
+            sendEv({ t: 'revived', lc: LC() });
+        }
+        function tryRevive() {
+            if (!S.dead || S.loading || !S.inGame) return;
+            if (S.revivedLc === LC()) return;                                    // never twice for the same level
+            if (LC() > S.deadLc && S.revAuth >= LC()) revive();
+        }
+        // runs after every level is built
+        function reviveCheck() {
+            if (S.solo || !S.together) { if (S.dead) resetDead(); return; }
+            const lc = LC();
+            if (S.isHost) {
+                // authority: the host decides who comes back (itself and every peer that reported being eliminated on an older level)
+                const ids = [];
+                if (S.dead && lc > S.deadLc) { S.revAuth = Math.max(S.revAuth, lc); ids.push(S.id); }
+                for (const p of S.peers.values()) if (p.dead) ids.push(p.id);
+                tryRevive();
+                if (ids.length && hasPeers()) sendEv({ t: 'rev', lc, ids });
+                for (const p of S.peers.values()) if (p.dead && p.ev && p.ev.open) p.dead = false;   // optimistic; the peer's next state packet confirms
+            } else if (S.dead && lc > S.deadLc) {
+                tryRevive();
+                // fallback when the host's message never arrives (host left, packet lost): revive locally after a short wait
+                if (S.dead && !S.reviveTimer) {
+                    const lc0 = lc;
+                    S.reviveTimer = setTimeout(() => {
+                        S.reviveTimer = null;
+                        if (S.dead && LC() === lc0 && S.revivedLc !== lc0) { S.revAuth = Math.max(S.revAuth, lc0); revive(); }
+                    }, 3000);
+                }
+            }
+        }
+        // each physics step while eliminated: no shooting, follow a living teammate, stay unhurt
+        Matter.Events.on(engine, 'beforeUpdate', guard('spectate', () => {
+            if (!S.dead) return;
+            try { input.fire = false; input.field = false; } catch (e) { }
+            m.immuneCycle = m.cycle + 1e9;
+            if (m.health > 0.01) m.health = 0.001;
+            const live = livingOthers().filter(p => p.cur && Number.isFinite(p.cur.x)).sort((a, b) => a.id < b.id ? -1 : 1)[0];
+            if (live) {
+                const x = live.cur.x, y = live.cur.y - 40;
+                Matter.Body.setPosition(player, { x, y }); Matter.Body.setVelocity(player, { x: 0, y: 0 });
+                if (m.pos) { m.pos.x = x; m.pos.y = y; }
+            }
+        }));
+        // everyone left alive is gone (they disconnected or died): the run ends for real
+        function checkAllDown() {
+            if (!S.dead || S.forceDeath || now() - S.deadAt < 1500) return;
+            if (livingOthers().length === 0) { S.forceDeath = true; try { m.death(); } finally { S.forceDeath = false; S.dead = false; try { ui.banner(null); } catch (e) { } } }
         }
         // ---- level order: the host's list is authoritative (level pools / local levels may differ per player) ----
         function lvInfo() { return { lv: Array.isArray(level.levels) ? level.levels.slice() : null, fl: !!simulation.isHorizontalFlipped }; }
@@ -932,7 +1076,7 @@
         function runCatchup() { if (S.inGame && !S.loading && S.catchTarget > LC() && !S.catchRunning) syncToLevel(S.catchTarget); }
 
         const onStartPre = guard('startGame.pre', () => {
-            S.starting = true; destroyGhosts(); resetSync();
+            S.starting = true; destroyGhosts(); resetSync(); resetDead();
             if (!S.applying) S.catchTarget = 0;
             S.catchRunning = false;
             S.loading = true; S.loadingSince = now(); S.inGame = false;
@@ -996,6 +1140,7 @@
         }
         const onClearPre = guard('clearMap.pre', () => {
             destroyGhosts(); resetSync(); S.loading = true; S.loadingSince = now();
+            for (const q_ of S.peers.values()) { q_.buf = []; q_.bl = null; q_.blAt = 0; q_.cur = null; q_.lastRecvT = 0; }
             if (S.starting) { S.starting = false; }
             else if (S.remotePending) { S.remotePending = false; }                  // level change requested by another player
             else if (S.inGame && S.together && !S.solo && hasPeers()) {              // we changed level: tell everybody
@@ -1249,6 +1394,7 @@
             if (!S.isHost) for (const mo of mob) puppetize(mo);
             S.aliveIds = new Set(); for (const mo of mob) if (mo && !mo.isGhost && mo._nid !== undefined && mo.alive) S.aliveIds.add(mo._nid);
             S.loading = false;
+            try { reviveCheck(); } catch (e) { console.warn('[MP] revive', e); }
             if (S.isHost && hasPeers()) {
                 sendMobRoster();
                 sendButtonSnapshot();
@@ -1390,7 +1536,7 @@
         function retarget() {
             if (simulation.cycle % 4) return;
             const targets = [];
-            if (m.alive && !m.isCloak) targets.push(player.position);
+            if (m.alive && !m.isCloak && !S.dead) targets.push(player.position);
             for (const g of ghosts.values()) { const p = S.peers.get(g.gid); if (p && p.alive && !peerPaused(p) && g.position) targets.push(g.position); }
             if (targets.length < 2) return;
             for (const mo of mob) {
@@ -1604,7 +1750,7 @@
         function drawPeerBullets(p) {
             const a = p.bl;
             if (!a || !a.length || now() - p.blAt > CFG.staleMs) return;
-            const fr = Math.min(6, Math.max(0, (now() - p.blAt) / 16.7));
+            const fr = Math.min(6, Math.max(0, (now() - p.blAt) / stepMs()));
             const fill = (typeof color !== 'undefined' && color.bullet) || '#000';
             for (let i = 0; i + 7 < a.length; i += 8) {
                 const x = a[i] + a[i + 2] / 10 * fr, y = a[i + 1] + a[i + 3] / 10 * fr;
@@ -1652,13 +1798,13 @@
         function localPlayer() {
             const pos = m.pos || player.position, mi = simulation.mouseInGame || { x: 0, y: 0 };
             const pz = S.paused;
-            return [q(pos.x), q(pos.y), pz ? 0 : q(player.velocity.x, 100), pz ? 0 : q(player.velocity.y, 100), q(m.angle, 1000), m.alive ? 1 : 0,
+            return [q(pos.x), q(pos.y), pz ? 0 : q(player.velocity.x, 100), pz ? 0 : q(player.velocity.y, 100), q(m.angle, 1000), (m.alive && !S.dead) ? 1 : 0,
             b.activeGun == null ? 255 : b.activeGun, m.fieldMode == null ? 255 : m.fieldMode, q(mi.x), q(mi.y),
-            q(m.health, 1000), q(m.maxHealth, 1000), S.pvp ? 1 : 0, m.onGround ? 1 : 0, q(m.yOff), pz ? 1 : 0];
+            q(m.health, 1000), q(m.maxHealth, 1000), S.pvp ? 1 : 0, m.onGround ? 1 : 0, q(m.yOff), pz ? 1 : 0, S.dead ? 1 : 0];
         }
         function bulletSnap() {
             const out = [], n = bullet.length;
-            if (S.paused) return out;
+            if (S.paused || S.dead) return out;
             for (let i = Math.max(0, n - CFG.maxBullets); i < n; i++) {
                 const bl = bullet[i]; if (!bl || !bl.position) continue;
                 let kind = 0, w = 0, h = 0; const vt = bl.vertices;
@@ -1680,7 +1826,7 @@
             return out;
         }
         function sendState() {
-            const pkt = { t: 's', lc: LC(), p: localPlayer(), bl: bulletSnap() };
+            const pkt = { t: 's', lc: LC(), ep: S.epoch, sq: ++S.sendSeq, ts: Math.round(now() * 10) / 10, p: localPlayer(), bl: bulletSnap() };
             const bk = [];
             for (const bd of bodyMap.values()) {
                 // Include non-holdable shared doors and moving level machinery too.
@@ -1755,6 +1901,7 @@
             try {
                 updatePaused();
                 levelWatch();
+                checkAllDown();
                 if (!S.inGame || S.loading || S.solo) return;
                 wrapSpawns();
                 if (S.tickN % 4 === 0 && S.id && computeHost() !== S.hostId) refreshRole();   // hand the host role to / back from an active player
@@ -1902,6 +2049,9 @@
                 st.textContent = 'Status: ' + people;
                 refreshDir();
             }
+            const bannerEl = mk('div', '', document.body);
+            bannerEl.style.cssText = 'position:fixed;left:50%;top:14px;transform:translateX(-50%);z-index:10000;max-width:min(560px,92vw);padding:10px 16px;background:rgba(24,29,37,.92);color:#fff;border:1px solid #c0504d;border-radius:10px;font:14px Arial,sans-serif;text-align:center;display:none;pointer-events:none';
+            function banner(text) { if (text) { bannerEl.textContent = text; bannerEl.style.display = 'block'; } else bannerEl.style.display = 'none'; }
             function notify(title, message, accept, decline) {
                 notice.textContent = '';
                 mk('strong', title, notice);
@@ -1922,7 +2072,7 @@
                     if (document.activeElement !== topName) topName.value = S.baseName;
                 },
                 status(s) { st.textContent = 'Status: ' + s; },
-                notify, refresh, refreshDir
+                notify, banner, refresh, refreshDir
             };
         })();
 
@@ -1976,6 +2126,7 @@
         wrapPopulateLevels();
         wrapLevelFrameRandom();
         wrapNewFeatures();
+        wrapDeath();
 
         // Keep n-gon's native 72 Hz simulation speed regardless of the selected FPS cap.
         // The original game advances one simulation cycle per rendered frame, so selecting
