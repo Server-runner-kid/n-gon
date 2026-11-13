@@ -294,8 +294,9 @@
             c.on('error', () => {});
         }
         function onUnavailable(e) {
-            const mt = /peer\s+(\S+)/.exec((e && e.message) || ''); const id = mt && mt[1];
-            if (id === LOBBY_ID) { lobbyMissing(); return; }
+            const message = String((e && e.message) || '');
+            const mt = /peer\s+(\S+)/i.exec(message); const id = mt && mt[1];
+            if (id === LOBBY_ID || message.includes(LOBBY_ID)) { lobbyMissing(); return; }
             if (!id) { ui.status('player not found'); return; }
             const sp = S.peers.get(id); if (sp && !(sp.ev && sp.ev.open)) S.peers.delete(id);
             if (pendingJoin.has(id)) { const alt = pendingJoin.get(id); pendingJoin.delete(id); connectTo(alt); return; }
@@ -324,7 +325,11 @@
             c.on('open', () => { lastReg = ''; sendReg(); });
             c.on('data', d => { if (d && d.t === 'dir' && Array.isArray(d.l)) setDir(d.l); });
             c.on('close', () => { if (hubConn === c) { hubConn = null; if (gen === peerGen && !S.tearing) scheduleLobby(); } });
-            c.on('error', () => { });
+            c.on('error', e => {
+                if (hubConn === c) hubConn = null;
+                if (gen === peerGen && !S.tearing && e && e.type === 'peer-unavailable') lobbyMissing();
+                else if (gen === peerGen && !S.tearing) scheduleLobby(1200);
+            });
         }
         function scheduleLobby(ms) {
             clearTimeout(hubTimer);
@@ -1542,9 +1547,10 @@
             const css = document.createElement('style');
             css.textContent = `
 #mp-panel{width:min(350px,calc(100vw - 24px));max-height:55vh;overflow:auto;box-sizing:border-box;font:13px Arial,sans-serif;color:#eee;background:var(--card-color,rgba(20,24,30,.96));border:1px solid rgba(255,255,255,.22);border-radius:8px;padding:10px;margin-top:6px;box-shadow:0 6px 24px rgba(0,0,0,.25)}
-#mp-namebar{position:fixed;top:10px;right:12px;z-index:9998;display:flex;gap:5px;align-items:center;padding:6px 8px;border:1px solid rgba(255,255,255,.2);border-radius:8px;background:rgba(20,24,30,.9);color:#eee;font:12px Arial,sans-serif;backdrop-filter:blur(8px)}
-#mp-namebar input{width:130px;max-width:30vw;background:#101318;color:#fff;border:1px solid #59616c;border-radius:5px;padding:5px}
-#mp-namebar button,#mp-panel button{background:#343d49;color:#f5f5f5;border:1px solid #657080;border-radius:5px;padding:5px 9px;cursor:pointer}
+#mp-namebar{position:fixed;top:10px;left:12px;right:auto;z-index:9998;display:flex;gap:5px;align-items:center;padding:6px 8px;border:1px solid #bbb;border-radius:8px;background:#fff;color:#111;font:12px Arial,sans-serif;box-shadow:0 2px 10px rgba(0,0,0,.2)}
+#mp-namebar input{width:130px;max-width:30vw;background:#fff;color:#111;border:1px solid #999;border-radius:5px;padding:5px}
+#mp-namebar button{background:#eee;color:#111;border:1px solid #999;border-radius:5px;padding:5px 9px;cursor:pointer}
+#mp-panel button{background:#343d49;color:#f5f5f5;border:1px solid #657080;border-radius:5px;padding:5px 9px;cursor:pointer}
 #mp-notice{position:fixed;right:14px;top:54px;z-index:10001;width:min(340px,calc(100vw - 28px));padding:12px;background:rgba(24,29,37,.98);color:#fff;border:1px solid #647184;border-radius:10px;box-shadow:0 8px 28px rgba(0,0,0,.45);font:13px Arial,sans-serif}
 #mp-notice strong{display:block;margin-bottom:5px;font-size:14px}#mp-notice .actions{display:flex;gap:7px;margin-top:10px}#mp-notice button{flex:1;padding:7px;border-radius:6px;border:1px solid #68778b;background:#394657;color:white;cursor:pointer}#mp-notice button.primary{background:#287a58;border-color:#43a77b}
 #mp-panel *{box-sizing:border-box}
@@ -1558,7 +1564,7 @@
 #mp-panel .muted{color:#aab3c0;font-size:12px}
 #mp-panel .dot{width:8px;height:8px;border-radius:50%;background:#3a3;flex:none}
 #multiplayer-details>summary{cursor:pointer;pointer-events:auto}
-@media(max-width:600px){#mp-namebar{top:8px;right:8px}#mp-namebar input{width:95px}#mp-panel{max-height:45vh}}
+@media(max-width:600px){#mp-namebar{top:8px;left:8px}#mp-namebar input{width:95px}#mp-panel{max-height:45vh}}
 `;
             document.head.appendChild(css);
 
@@ -1650,6 +1656,7 @@
                 }
             }
             function refresh() {
+                namebar.style.display = (S.inGame || S.loading) ? 'none' : 'flex';
                 const open = openPeers();
                 const people = S.id ? (open.length ? 'connected to ' + open.map(p => p.name).join(', ') + ' (' + (open.length + 1) + ' players, you are the ' + (S.isHost ? 'host' : 'client') + ')' : 'not connected to anyone yet') : 'connecting...';
                 st.textContent = 'Status: ' + people;
@@ -1817,8 +1824,8 @@
         if (gameRunning()) { S.inGame = true; S.runSeed = String(Math.initialSeed != null ? Math.initialSeed : getSeed()); guard('initial.load', afterLevelLoaded)(); }
         setInterval(guard('detect', () => {
             const run = gameRunning();
-            if (!S.inGame && !S.loading && run) { S.inGame = true; if (S.runSeed == null) S.runSeed = String(Math.initialSeed != null ? Math.initialSeed : getSeed()); afterLevelLoaded(); }
-            else if (S.inGame && !run && typeof simulation.onTitlePage === 'boolean') { S.inGame = false; S.loading = false; S.paused = false; if (S.solo) { S.solo = false; refreshRole(); } destroyGhosts(); resetSync(); }   // back on the title screen
+            if (!S.inGame && !S.loading && run) { S.inGame = true; if (S.runSeed == null) S.runSeed = String(Math.initialSeed != null ? Math.initialSeed : getSeed()); afterLevelLoaded(); ui.refresh(); }
+            else if (S.inGame && !run && typeof simulation.onTitlePage === 'boolean') { S.inGame = false; S.loading = false; S.paused = false; if (S.solo) { S.solo = false; refreshRole(); } destroyGhosts(); resetSync(); ui.refresh(); }   // back on the title screen
         }), 500);
         startPeer(S.baseName);
         window.ngonMP = {
