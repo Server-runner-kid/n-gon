@@ -1,5 +1,5 @@
 /*
- * n-gon multiplayer v9-B  (v9-A + ordered/stale-proof player snapshots, per-level validation; elimination + revival; permission-based joins)
+ * n-gon multiplayer v9-E  (v9-D + match management: host-authoritative level changes, reconnect/late-join parity, duplicate-connection fix, training isolation; combat sync: duplicate-damage guards, mirrored explosions, bullets on the ghost time base, field/immunity visuals; elimination + revival; ordered snapshots; world sync fixes; permission-based joins)
  *
  * Design
  *  - Every client runs its OWN player, guns, techs and fields with the game's normal code.
@@ -138,16 +138,17 @@
             name: localStorage.getItem('p2pUsername') || 'player',
             peers: new Map(),
             together: true, pvp: true,
+            forceLocalNext: false, hostAction: false, lvlReqLc: -1, lvlReqAt: 0,
             inGame: false, loading: false, applying: false, replay: false, inPuppet: false,
             replayNew: [], grp: 0, ctr: 0, tickN: 0,
             aliveIds: null, mc: null,
             catchTarget: -1, catchRunning: false,
             runSeed: null, remotePending: false,
             paused: false, pausedAt: 0, stuck: 0, lastCycle: -1, hostCy: null,
-            epoch: (crypto.getRandomValues(new Uint32Array(1))[0]).toString(36), sendSeq: 0, dead: false, deadLc: -1, deadAt: 0, revivedLc: -1, revAuth: -1, forceDeath: false, reviveTimer: null,
+            dmgSeq: 0, fxSeq: 0, epoch: (crypto.getRandomValues(new Uint32Array(1))[0]).toString(36), sendSeq: 0, dead: false, deadLc: -1, deadAt: 0, revivedLc: -1, revAuth: -1, forceDeath: false, reviveTimer: null,
             buttons: [], buttonSeq: 0, buttonSent: new Map(), remoteButtons: new Map(),
             buildingLevel: false, lastRosterAt: 0, lastButtonSnapshotAt: 0,
-            solo: false, savePending: false, saveStarted: false, saveWatching: false, olWarned: -1, forceLv: null, forceFlip: null,
+            solo: false, savePending: false, saveStarted: false, saveWatching: false, olWarned: -1, forceLv: null, forceFlip: null, forceDf: null,
             mapIds: null, mapSent: new Map(), mapBase: new Map(),
         };
         const ghosts = new Map();       // peerId -> ghost mob
@@ -157,6 +158,7 @@
         let spawnQ = [], deathQ = [], opsQ = [], dropQ = [];
         let bodySnapshotSeen = null;
         const dmgOut = new Map();       // netId -> [dmg, pierce]
+        let fxQ = [];                    // explosion visuals to mirror on the other players' screens
         const pvpOut = new Map();       // peerId -> dmg
 
         // ------------------------------------------------------------------ networking
@@ -482,11 +484,13 @@
             const initiator = outgoing ? S.id : pid; c._init = initiator;
             const p = S.peers.get(pid) || newPeer(pid);
             const cur = p[slot];
-            if (cur && cur !== c && cur.open) { // duplicate: keep the one initiated by the smaller id (both sides agree)
+            const curDead = cur && cur._was && !cur.open;                          // opened once, closed since: not a real duplicate
+            if (cur && cur !== c && !curDead) { // duplicate (open OR still connecting): keep the one initiated by the smaller id, so both sides agree
                 if (cur._init <= initiator) { try { c.close(); } catch (e) { } return; }
                 try { cur.close(); } catch (e) { }
             }
             p[slot] = c;
+            c.on('open', () => { c._was = true; });
             c.on('data', d => { if (p[slot] !== c || S.peers.get(pid) !== p) return; onDataSafe(p, d); });   // stale / replaced connection or removed peer
             c.on('close', () => { if (S.tearing) return; if (p[slot] === c) { p[slot] = null; if (slot === 'ev') dropPeer(p); } });
             c.on('error', () => {
@@ -605,7 +609,7 @@
                 if (d.seed == null) return;
                 S.runSeed = String(d.seed);
                 S.catchTarget = Math.max(0, d.lc | 0);
-                beginRun(S.runSeed, d.lv, d.fl);
+                beginRun(S.runSeed, d.lv, d.fl, d.df);
             } else if (!S.inGame && !d.inGame && p.id === (S.sessionHostId || S.hostId) && d.seed != null) {
                 setSeed(String(d.seed));                                        // the joined session host supplies the lobby seed
             } else if (d.inGame && S.inGame && S.together && (d.lc | 0) !== LC()) {
@@ -648,16 +652,41 @@
         H.start = (p, d) => {
             if (!isHostPeer(p) || S.inGame || S.loading || S.starting || d.seed == null) return;
             S.runSeed = String(d.seed);
-            beginRun(S.runSeed, d.lv, d.fl);
+            beginRun(S.runSeed, d.lv, d.fl, d.df);
         };
         H.lvl = (p, d) => {
             if (!S.together || !S.inGame || S.solo || !Number.isFinite(Number(d.lc))) return;
             const target = Math.max(0, d.lc | 0);
             if (LC() < target) syncToLevel(target);
         };
+        H.lvlReq = (p, d) => {
+            if (!S.isHost || S.solo || !S.together || !S.inGame || !S.peers.has(p.id) || !p.hello || p.dead) return;
+            if ((d.lc | 0) !== LC() || S.loading || simulation.clearNow || S.starting) return;   // stale request: that level change already happened
+            S.hostAction = true;
+            try { level.nextLevel(); } catch (e) { console.warn('[MP] level change for a guest failed', e); } finally { S.hostAction = false; }
+        };
+        H.resyncReq = (p, d) => {
+            if (!S.isHost || S.solo || !S.inGame || S.loading || !S.peers.has(p.id) || !p.hello) return;
+            if (now() - (p.resyncAt || 0) < 15000) return;
+            p.resyncAt = now();
+            sendEv({ t: 'resync', seed: S.runSeed, lc: LC(), ...lvInfo() }, p.id);
+        };
+        H.fx = (p, d) => {
+            if (!S.peers.has(p.id) || S.solo || S.paused || S.loading || (d.lc | 0) !== LC() || !Array.isArray(d.l)) return;
+            if (Number.isInteger(d.q)) { if (d.q <= (p.fxQ | 0)) return; p.fxQ = d.q; }
+            for (const e of d.l.slice(0, 12)) {
+                if (!Array.isArray(e)) continue;
+                const x = Number(e[0]), y = Number(e[1]), r = Number(e[2]), col = e[3];
+                if (![x, y, r].every(Number.isFinite) || r <= 0 || r > 3000 || Math.abs(x) > 1e7 || Math.abs(y) > 1e7) continue;
+                if (typeof col !== 'string' || col.length > 48 || !/^rgba?\([0-9., %]+\)$|^#[0-9a-fA-F]{3,8}$/.test(col)) continue;
+                try { simulation.drawList.push({ x, y, radius: r, color: col, time: simulation.drawTime }); } catch (er) { }   // visual only: damage is decided by the owner
+            }
+        };
         H.chat = (p, d) => say(esc(p.name) + ': ' + esc(String(d.x || '').slice(0, 200)), true);
         H.pvp = (p, d) => {
             if (!S.peers.has(p.id) || !S.pvp || S.paused || !m.alive || (d.lc | 0) !== LC() || typeof m.takeDamage !== 'function' || !Number.isFinite(d.d)) return;
+            if (Number.isInteger(d.q)) { if (d.q <= (p.pvpQ | 0)) return; p.pvpQ = d.q; }      // a repeated / reordered damage packet must never hurt twice
+            if (S.dead || !p.alive || p.dead) return;                                              // eliminated players deal no damage
             m.takeDamage(Math.max(0, Math.min(d.d, 2)));
         };
         H.mc = (p, d) => {
@@ -665,7 +694,8 @@
             // the host is on a different level than us at the same level count => our level pool / local levels / seed differ
             if (d.ol != null && !S.loading && (d.lc | 0) === LC() && String(level.onLevel) !== String(d.ol) && S.olWarned !== LC()) {
                 S.olWarned = LC();
-                say('your level order differs from the host (level pool or local levels). Make your level pool match the host, otherwise the maps will not match.');
+                say('your level differs from the host - asking the host to resync you');
+                sendEv({ t: 'resyncReq' }, p.id);                                // the host restarts us on its exact level list
             }
             S.mc = d; checkMc();
         };
@@ -675,8 +705,9 @@
             if (S.inGame) {
                 S.forceLv = Array.isArray(d.lv) ? d.lv.map(String).slice(0, 64) : null;
                 S.forceFlip = typeof d.fl === 'boolean' ? d.fl : null;
+                S.forceDf = cleanDiff(d.df);
                 startLocalGame(S.runSeed);
-            } else beginRun(S.runSeed, d.lv, d.fl);
+            } else beginRun(S.runSeed, d.lv, d.fl, d.df);
         };
         H.mg = (p, d) => {                // map bodies destroyed by the host
             if (S.isHost || !isHostPeer(p) || (d.lc | 0) !== LC() || !S.mapIds || !Array.isArray(d.l)) return;
@@ -701,7 +732,8 @@
         };
         H.mfull = (p, d) => {
             if (S.isHost || !isHostPeer(p) || (d.lc | 0) !== LC() || !Array.isArray(d.l)) return;
-            for (const mo of realMobs()) { mobMap.delete(mo._nid); killSilently(mo); }
+            for (const mo of realMobs()) killSilently(mo);
+            mobMap.clear();                                   // entries of mobs the game already removed would make the replay skip them
             applySpawnEvents(d.l.slice(0, 500));
             S.mc = null;
         };
@@ -737,6 +769,8 @@
         };
         H.dm = (p, d) => {
             if (!S.isHost || S.solo || !S.peers.has(p.id) || (d.lc | 0) !== LC() || !Array.isArray(d.l)) return;
+            if (Number.isInteger(d.q)) { if (d.q <= (p.dmQ | 0)) return; p.dmQ = d.q; }
+            if (p.dead) return;
             for (const e of d.l.slice(0, 120)) {
                 if (!Array.isArray(e) || typeof e[0] !== 'string' || !Number.isFinite(e[1])) continue;
                 const amount = Math.max(0, Math.min(100, e[1]));
@@ -761,7 +795,13 @@
                 } else if (op[0] === 'r') {
                     if (typeof op[1] !== 'string') continue;
                     const bd = bodyMap.get(op[1]); if (!bd) continue;
-                    if (!fromHost && bd._owner !== p.id) continue;
+                    // ownership: only the owner may destroy a shared object, except that anything destroyed right next to the sender (explosions,
+                    // lasers, crushers) is accepted as well so a block cannot end up destroyed for one player and intact for the others
+                    if (!fromHost && bd._owner !== p.id) {
+                        const c = p.cur || (Array.isArray(p.buf) && p.buf.length ? p.buf[p.buf.length - 1] : null);
+                        const near = c && Number.isFinite(c.x) && Number.isFinite(c.y) && Math.hypot(bd.position.x - c.x, bd.position.y - c.y) < 1000;
+                        if (!near) continue;
+                    }
                     bodyMap.delete(op[1]); bd._gone = true;
                     Composite.remove(engine.world, bd); const i = body.indexOf(bd); if (i !== -1) body.splice(i, 1);
                     if (S.isHost) relay.push(['r', op[1]]);
@@ -848,13 +888,13 @@
             const a = d.p;
             if (Array.isArray(a) && a.length >= 16 && a.slice(0, 16).every(Number.isFinite)) {
                 const wasPaused = p.paused;
-                p.alive = !!a[5]; p.pvp = !!a[12]; p.mhp = Math.max(0.0001, Math.min(1e6, a[11] / 1000)); p.hp = Math.max(0, Math.min(p.mhp, a[10] / 1000)); p.og = !!a[13]; p.yOff = a[14]; p.paused = !!a[15]; p.dead = a[16] === 1;
+                p.alive = !!a[5]; p.pvp = !!a[12]; p.mhp = Math.max(0.0001, Math.min(1e6, a[11] / 1000)); p.hp = Math.max(0, Math.min(p.mhp, a[10] / 1000)); p.og = !!a[13]; p.yOff = a[14]; p.paused = !!a[15]; p.dead = a[16] === 1; p.fa = a[17] === 1; p.imm = a[18] === 1; p.fr = Number.isFinite(a[19]) ? Math.max(0, Math.min(400, a[19])) : 0;
                 if (p.paused && !wasPaused) p.pausedAt = now();
                 p.buf.push({ t: st, x: a[0], y: a[1], vx: a[2] / 100, vy: a[3] / 100, a: a[4] / 1000 });
                 if (p.buf.length > 10) p.buf.shift();
             }
             // Bullet snapshots are visual-only. Reject malformed/oversized arrays before drawing.
-            p.bl = (d.lc === LC() && Array.isArray(d.bl)) ? d.bl.slice(0, CFG.maxBullets * 8).map(v => Number.isFinite(v) ? v : 0) : null;
+            p.blT = st; p.bl = (d.lc === LC() && Array.isArray(d.bl)) ? d.bl.slice(0, CFG.maxBullets * 8).map(v => Number.isFinite(v) ? v : 0) : null;
             if (p.bl && p.bl.length % 8) p.bl.length -= p.bl.length % 8;
             p.blAt = now();
             const fromHost = isHostPeer(p);
@@ -914,10 +954,32 @@
             });
             wrapFn(m, 'takeDamage', 'm.takeDamage', orig => function () { if (S.dead) return undefined; return orig.apply(this, arguments); });
             // an eliminated player cannot advance the level by standing in the exit
+            // Level changes are decided by the HOST. A guest that reaches an exit only asks; the host changes level and everybody (the asking
+            // guest included) follows its 'lvl' message, so two players can never end up on different levels because of racing exits.
             wrapFn(level, 'nextLevel', 'level.nextLevel', orig => function () {
-                if (S.dead && !S.applying && !S.remotePending && !S.forceDeath) return undefined;
+                if (S.dead && !S.applying && !S.remotePending && !S.forceDeath && !S.hostAction) return undefined;
+                if (!S.isHost && !S.applying && !S.remotePending && !S.forceLocalNext && S.together && S.inGame && !S.solo && !S.starting && hasPeers()
+                    && S.hostId && S.peers.has(S.hostId) && !simulation.isTraining) {
+                    requestNextLevel();
+                    return undefined;
+                }
+                S.forceLocalNext = false;
                 return orig.apply(this, arguments);
             });
+        }
+        function requestNextLevel() {
+            const lc0 = LC();
+            if (S.lvlReqLc === lc0 && now() - S.lvlReqAt < 1500) return;          // the exit fires every frame while we stand in it
+            S.lvlReqLc = lc0; S.lvlReqAt = now();
+            sendEv({ t: 'lvlReq', lc: lc0 }, S.hostId);
+            // if the host never answers (it vanished without the connection closing) do not leave everybody stuck at the exit
+            setTimeout(() => {
+                if (LC() !== lc0 || S.isHost || !S.inGame || S.solo || S.loading || simulation.clearNow) return;
+                const hp = S.peers.get(S.hostId);
+                if (hp && now() - (hp.seenAt || 0) < 4000) { S.lvlReqLc = -1; return; }   // host is alive, just busy: the next exit frame asks again
+                S.forceLocalNext = true;
+                try { level.nextLevel(); } catch (e) { S.forceLocalNext = false; }
+            }, 7000);
         }
         function eliminate() {
             S.dead = true; S.deadLc = LC(); S.deadAt = now(); S.revAuth = Math.min(S.revAuth, S.deadLc);
@@ -1003,7 +1065,13 @@
             if (livingOthers().length === 0) { S.forceDeath = true; try { m.death(); } finally { S.forceDeath = false; S.dead = false; try { ui.banner(null); } catch (e) { } } }
         }
         // ---- level order: the host's list is authoritative (level pools / local levels may differ per player) ----
-        function lvInfo() { return { lv: Array.isArray(level.levels) ? level.levels.slice() : null, fl: !!simulation.isHorizontalFlipped }; }
+        function lvInfo() { return { lv: Array.isArray(level.levels) ? level.levels.slice() : null, fl: !!simulation.isHorizontalFlipped, df: cleanDiff(simulation.difficultyOptions) }; }
+        function cleanDiff(o) {
+            if (!o || typeof o !== 'object') return null;
+            const r = {}; let n = 0;
+            for (const k of Object.keys(o)) { const v = o[k]; if (++n > 64) break; if (typeof v === 'boolean' || (typeof v === 'number' && Number.isFinite(v)) || (typeof v === 'string' && v.length < 40)) r[String(k).slice(0, 40)] = v; }
+            return r;
+        }
         function mapsAvailable(name) {
             try { return [level.maps, level.localMaps, typeof moreLevels === 'undefined' ? null : moreLevels].some(m_ => m_ && Object.prototype.hasOwnProperty.call(m_, name) && typeof m_[name] === 'function'); }
             catch (e) { return true; }
@@ -1020,9 +1088,10 @@
                 return true;
             });
         }
-        function beginRun(seed, lv, fl) {      // join a run started by someone else
+        function beginRun(seed, lv, fl, df) {      // join a run started by someone else
             S.forceLv = Array.isArray(lv) ? lv.map(String).slice(0, 64) : null;
             S.forceFlip = typeof fl === 'boolean' ? fl : null;
+            S.forceDf = cleanDiff(df);
             return prepareRoute(S.forceLv).then(ok => {
                 if (!ok) { S.forceLv = null; S.forceFlip = null; }
                 if (S.inGame || S.starting) return;
@@ -1067,7 +1136,17 @@
                 if (simulation.clearNow || S.loading) { setTimeout(step, 40); return; }   // previous level still being built (or this player is paused)
                 S.remotePending = true;                                                   // consumed by the next clearMap
                 S.applying = true;
+                const wasChoosing = !!simulation.isChoosing;
                 try { level.nextLevel(); } catch (e) { console.warn('[MP] could not advance level', e); S.catchRunning = false; S.remotePending = false; return; } finally { S.applying = false; }
+                // n-gon pauses on an info screen when entering "reactor"/"final". The player who reached the exit already saw it;
+                // following players must not be stalled for seconds on it. We are still inside the same task, so no frame ran
+                // between the pause and this undo and the game loop's frame chain is intact (do NOT request another frame).
+                if (!wasChoosing && simulation.isChoosing && simulation.paused && simulation.clearNow) {
+                    simulation.isChoosing = false; simulation.paused = false;
+                    try { const cg = document.getElementById('choose-grid'); cg.style.visibility = 'hidden'; cg.style.opacity = '0'; } catch (e) { }
+                    try { build.unPauseGrid(); } catch (e) { }
+                    try { document.body.style.cursor = 'none'; } catch (e) { }
+                }
                 if (!simulation.clearNow) S.remotePending = false;
                 setTimeout(step, 60);
             };
@@ -1117,10 +1196,19 @@
             // a different constraint order than a fresh one
             if (!loadingSave && !simulation.isTraining) { canonConstraints(); }
             onStartPre();
+            let restoreDf = null;
+            if (S.applying && S.forceDf && !simulation.isTraining && typeof localSettings === 'object' && localSettings) {
+                const saved = localSettings.difficultyOptions;
+                localSettings.difficultyOptions = { ...S.forceDf };                      // startGame reads the player's OWN saved difficulty
+                restoreDf = () => { localSettings.difficultyOptions = saved; };
+            }
+            S.forceDf = null;
             let r;
             try { r = orig.apply(this, arguments); }
-            catch (e) { S.starting = false; S.loading = false; throw e; }
+            catch (e) { if (restoreDf) restoreDf(); S.starting = false; S.loading = false; throw e; }
+            if (restoreDf && !(r && typeof r.then === 'function')) restoreDf();
             const fin = () => {
+                if (restoreDf) restoreDf();
                 S.inGame = true; S.loadingSince = now(); S.starting = false;
                 if (S.runSeed == null) S.runSeed = String(getSeed());
                 if (!loadingSave) setSeed(S.runSeed);
@@ -1136,6 +1224,17 @@
             try {
                 if (Array.isArray(level.constraint)) level.constraint.sort((a, b) => String(a.description).localeCompare(String(b.description)));
                 level.constraintIndex = 0;
+            } catch (e) { }
+            // spawn.setMobTypeSpawnOrder() seededShuffle()s spawn.tier[1..4] and spawn.bossTier[1..4] IN PLACE, starting from whatever order the
+            // previous run left behind. A player who already played a run therefore got different mob types/bosses than a fresh player
+            // even with the same seed. Start every shared run from the same (sorted) order, like n-gon's own level editor does.
+            try {
+                for (const key of ['tier', 'bossTier']) {
+                    const lists = spawn[key]; if (!Array.isArray(lists)) continue;
+                    for (let i = 1; i < lists.length; i++) if (Array.isArray(lists[i])) lists[i].sort();
+                }
+                if (Array.isArray(spawn.bossTierIndex)) spawn.bossTierIndex = spawn.bossTierIndex.map(() => 0);
+                spawn.mobTypeSpawnIndex = 0;
             } catch (e) { }
         }
         const onClearPre = guard('clearMap.pre', () => {
@@ -1375,7 +1474,7 @@
         }
         function resetSync() {
             mobMap.clear(); bodyMap.clear(); puMap.clear(); bodySnapshotSeen = null;
-            spawnQ = []; deathQ = []; opsQ = []; dropQ = []; dmgOut.clear(); pvpOut.clear();
+            spawnQ = []; deathQ = []; opsQ = []; dropQ = []; fxQ = []; dmgOut.clear(); pvpOut.clear();
             S.aliveIds = null; S.mc = null; S.ctr = 0; S.hostCy = null;
             S.buttons = []; S.buttonSeq = 0; S.buttonSent.clear(); S.remoteButtons.clear();
             S.mapIds = null; S.mapSent = new Map(); S.mapBase = new Map();
@@ -1393,7 +1492,7 @@
             assignMapIds();
             if (!S.isHost) for (const mo of mob) puppetize(mo);
             S.aliveIds = new Set(); for (const mo of mob) if (mo && !mo.isGhost && mo._nid !== undefined && mo.alive) S.aliveIds.add(mo._nid);
-            S.loading = false;
+            S.loading = false; S.builtAt = now();
             try { reviveCheck(); } catch (e) { console.warn('[MP] revive', e); }
             if (S.isHost && hasPeers()) {
                 sendMobRoster();
@@ -1403,6 +1502,13 @@
                 // generated its level bodies, map IDs, and button IDs.
                 sendEv({ t: 'mreq', lc: LC() }, S.hostId);
             }
+        }
+        // A guest never creates enemies by itself after the level is built: anything without a host id is a leftover (a shield rolled with
+        // local randomness, a direct mobs.spawn from level code...) and would be a duplicate of what the host sends.
+        function sweepStrays() {
+            if (S.isHost || S.solo || S.loading || S.catchRunning || !S.inGame || S.replay || S.buildingLevel) return;
+            if (now() - (S.builtAt || 0) < 1500) return;
+            for (const mo of realMobs()) if (mo.alive && mo._nid == null && !mo._keep) killSilently(mo);
         }
         function checkMc() {
             if (S.isHost || !S.mc || S.loading || S.catchRunning || !S.inGame) return;
@@ -1476,11 +1582,11 @@
         }
         function applySpawnEvents(list) {
             for (const ev of list || []) {
-                if (ev.ids.every(id => mobMap.has(id))) continue;
+                if (ev.ids.every(id => { const e = mobMap.get(id); return e && e.alive && mob.includes(e); })) continue;
                 let made = [];
                 if (ev.k && ev.a && typeof spawn[ev.k] === 'function') {
                     S.replay = true; S.replayNew = [];
-                    try { spawn[ev.k](...ev.a); } catch (e) { } finally { S.replay = false; }
+                    try { spawn[ev.k](...ev.a); } catch (e) { S.lastReplayError = ev.k + ': ' + (e && e.message); if ((errCount.replay | 0) < 5) { errCount.replay = (errCount.replay | 0) + 1; console.warn('[MP] could not replay spawn ' + ev.k, e); } } finally { S.replay = false; }
                     made = S.replayNew; S.replayNew = [];
                 } else {
                     try {
@@ -1495,9 +1601,14 @@
                     } catch (e) { }
                     finally { S.replay = false; }
                 }
-                for (let i = 0; i < made.length; i++) {
-                    const mo = made[i];
-                    if (i < ev.ids.length) { mo._nid = ev.ids[i]; mobMap.set(mo._nid, mo); puppetize(mo); }
+                // Replaying one spawn can create SIDE-EFFECT mobs first (a boss's orbiting orbs, shields, babies...). Those have their own
+                // ids/events on the host, so they must not take this event's ids: pick the mobs the function itself made (same _mt), the
+                // rest are removed. (Matching by creation order used to give the boss's id to an orb and delete the boss.)
+                const own = ev.k ? made.filter(mo => mo._mt === ev.k) : made;
+                const targets = own.length ? own : made;
+                for (const mo of made) {
+                    const i = targets.indexOf(mo);
+                    if (i !== -1 && i < ev.ids.length) { mo._nid = ev.ids[i]; mobMap.set(mo._nid, mo); puppetize(mo); }
                     else killSilently(mo);
                 }
             }
@@ -1712,18 +1823,23 @@
             Body.setStatic(g, true);
             g.damage = function (d) {
                 const pp = S.peers.get(this.gid);
-                if (!pp || !S.pvp || !pp.pvp || !pp.alive || peerPaused(pp) || !Number.isFinite(d)) return;   // paused players are invulnerable
+                if (!pp || !S.pvp || !pp.pvp || !pp.alive || pp.dead || pp.imm || peerPaused(pp) || !Number.isFinite(d)) return;   // paused players are invulnerable
                 pvpOut.set(pp.id, (pvpOut.get(pp.id) || 0) + d * CFG.pvpScale);
                 this._flash = 4;
             };
             g.do = guard('ghost.do', function () {
                 const pp = S.peers.get(this.gid); if (!pp) return;
                 const pz = peerPaused(pp);
-                this.isInvulnerable = pz || !(S.pvp && pp.pvp && pp.alive);
+                this.isInvulnerable = pz || pp.imm || !(S.pvp && pp.pvp && pp.alive);
                 if (!pz) drawPeerBullets(pp);
                 const s = pp.cur; if (!s || !pp.alive) return;
                 ctx.save();
                 if (pz) ctx.globalAlpha = 0.4;
+                else if (pp.imm) ctx.globalAlpha = (simulation.cycle % 6 < 3) ? 0.45 : 0.9;       // same flicker n-gon shows during damage immunity
+                if (pp.fa && !pz) {                                                                // field in use
+                    ctx.beginPath(); ctx.arc(s.x, s.y, Math.max(40, pp.fr || 120), 0, 2 * Math.PI);
+                    ctx.fillStyle = 'rgba(0,170,255,0.10)'; ctx.fill(); ctx.strokeStyle = 'rgba(0,170,255,0.35)'; ctx.lineWidth = 2; ctx.stroke();
+                }
                 drawRemotePlayer(pp, s, this._flash > 0);
                 if (this._flash > 0) this._flash--;
                 const w = 60, hp = Math.max(0, Math.min(1, (pp.hp || 0) / Math.max(0.0001, pp.mhp || 1)));
@@ -1742,7 +1858,7 @@
         function destroyGhosts() { for (const id of [...ghosts.keys()]) removeGhost(id); }
         function maintainGhosts() {
             for (const p of S.peers.values()) {
-                const want = S.inGame && !S.loading && p.buf.length && p.lc === LC();
+                const want = S.inGame && !S.loading && !S.solo && p.buf.length && p.lc === LC();
                 if (want && !ghosts.has(p.id)) makeGhost(p);
                 else if (!want && ghosts.has(p.id)) removeGhost(p.id);
             }
@@ -1750,7 +1866,8 @@
         function drawPeerBullets(p) {
             const a = p.bl;
             if (!a || !a.length || now() - p.blAt > CFG.staleMs) return;
-            const fr = Math.min(6, Math.max(0, (now() - p.blAt) / stepMs()));
+            // ghosts are drawn interpMs in the past: put their bullets at the same moment (extrapolating backwards a few steps is fine for linear flight)
+            const fr = Math.max(-9, Math.min(8, (now() - CFG.interpMs - (Number.isFinite(p.blT) ? p.blT : p.blAt)) / stepMs()));
             const fill = (typeof color !== 'undefined' && color.bullet) || '#000';
             for (let i = 0; i + 7 < a.length; i += 8) {
                 const x = a[i] + a[i + 2] / 10 * fr, y = a[i + 1] + a[i + 3] / 10 * fr;
@@ -1795,12 +1912,13 @@
         }));
 
         // ------------------------------------------------------------------ sending
+        function fieldOn() { try { return !!(input.field && m.energy > 0.02 && !(m.fieldCDcycle > m.cycle)); } catch (e) { return false; } }
         function localPlayer() {
             const pos = m.pos || player.position, mi = simulation.mouseInGame || { x: 0, y: 0 };
             const pz = S.paused;
             return [q(pos.x), q(pos.y), pz ? 0 : q(player.velocity.x, 100), pz ? 0 : q(player.velocity.y, 100), q(m.angle, 1000), (m.alive && !S.dead) ? 1 : 0,
             b.activeGun == null ? 255 : b.activeGun, m.fieldMode == null ? 255 : m.fieldMode, q(mi.x), q(mi.y),
-            q(m.health, 1000), q(m.maxHealth, 1000), S.pvp ? 1 : 0, m.onGround ? 1 : 0, q(m.yOff), pz ? 1 : 0, S.dead ? 1 : 0];
+            q(m.health, 1000), q(m.maxHealth, 1000), S.pvp ? 1 : 0, m.onGround ? 1 : 0, q(m.yOff), pz ? 1 : 0, S.dead ? 1 : 0, fieldOn() ? 1 : 0, (m.immuneCycle > m.cycle && !S.dead) ? 1 : 0, q(Math.min(400, Number(m.fieldRange) || 0))];
         }
         function bulletSnap() {
             const out = [], n = bullet.length;
@@ -1870,9 +1988,10 @@
             if (dropQ.length) { sendEv({ t: 'pd', lc, l: dropQ }); dropQ = []; }
             if (dmgOut.size) {
                 const l = []; for (const [id, e] of dmgOut) l.push([id, e[0], e[1]]);
-                dmgOut.clear(); sendEv({ t: 'dm', lc, l }, S.hostId);
+                dmgOut.clear(); sendEv({ t: 'dm', lc, l, q: ++S.dmgSeq }, S.hostId);
             }
-            if (pvpOut.size) { for (const [id, d] of pvpOut) sendEv({ t: 'pvp', lc, d }, id); pvpOut.clear(); }
+            if (pvpOut.size) { for (const [id, d] of pvpOut) sendEv({ t: 'pvp', lc, d, q: ++S.dmgSeq }, id); pvpOut.clear(); }
+            if (fxQ.length) { sendEv({ t: 'fx', lc, q: ++S.fxSeq, l: fxQ.slice(0, 12) }); fxQ = []; }
         }
         // am I paused? (pause menu, upgrade screen, hidden tab, or the game loop simply stopped advancing)
         function updatePaused() {
@@ -1902,6 +2021,7 @@
                 updatePaused();
                 levelWatch();
                 checkAllDown();
+                try { sweepStrays(); } catch (e) { }
                 if (!S.inGame || S.loading || S.solo) return;
                 wrapSpawns();
                 if (S.tickN % 4 === 0 && S.id && computeHost() !== S.hostId) refreshRole();   // hand the host role to / back from an active player
@@ -2127,6 +2247,23 @@
         wrapLevelFrameRandom();
         wrapNewFeatures();
         wrapDeath();
+        // explosions: n-gon draws them through simulation.drawList; copy exactly what an explosion drew so everybody sees it
+        if (typeof b !== 'undefined' && b && typeof b.explosion === 'function') {
+            wrapFn(b, 'explosion', 'b.explosion', orig => function () {
+                const list = simulation.drawList, n0 = list ? list.length : 0;
+                const r = orig.apply(this, arguments);
+                try {
+                    if (list && hasPeers() && S.isHost !== undefined && !S.solo && S.inGame && !S.loading) {
+                        for (let i = n0; i < list.length && i < n0 + 4; i++) {
+                            const e = list[i];
+                            if (e && Number.isFinite(e.x) && Number.isFinite(e.y) && Number.isFinite(e.radius) && typeof e.color === 'string') fxQ.push([q(e.x), q(e.y), q(e.radius), e.color]);
+                        }
+                        if (fxQ.length > 24) fxQ = fxQ.slice(-24);
+                    }
+                } catch (e) { }
+                return r;
+            });
+        } else HOOKS['b.explosion'] = false;
 
         // Keep n-gon's native 72 Hz simulation speed regardless of the selected FPS cap.
         // The original game advances one simulation cycle per rendered frame, so selecting
