@@ -1,0 +1,3042 @@
+/*
+ * n-gon multiplayer v10-J (cloak flash, blend modes, host-authoritative difficulty, guest experiment scroll; spectator camera, gravity-flip buttons, host room settings, panel UI; triangle bullets sent as real polygons; flash frames, shared self-spawned pickups, experimental ready gate, 9 KB packet budget, hashed mob roster; spectators removed from the world, real skins mirrored, no duplicate mob-death visuals, touch-to-claim blocks; F stability: packet validation/rate limits/chunking, pruning, invalid-body cleanup; visual mirror, guest mob effects, printed flag, real bullet shapes, cloak fix, spectators non-solid, pilot wave claim, shared experimental mode) / v9-E  (v9-D + match management: host-authoritative level changes, reconnect/late-join parity, duplicate-connection fix, training isolation; combat sync: duplicate-damage guards, mirrored explosions, bullets on the ghost time base, field/immunity visuals; elimination + revival; ordered snapshots; world sync fixes; permission-based joins)
+ *
+ * Design
+ *  - Every client runs its OWN player, guns, techs and fields with the game's normal code.
+ *  - Other players are lightweight "ghost" mobs (interpolated), so every existing bullet,
+ *    explosion or laser that damages mobs automatically supports PvP.
+ *  - Other players' bullets are streamed as generic shapes (visual only).
+ *  - Mobs are simulated by one host. Other clients get puppets that are position-interpolated;
+ *    damage they deal is forwarded to the host.
+ *  - Any number of players can join (full mesh, late join supported, in any join order).
+ *
+ * v4 features (kept)
+ *  - MAP SYNC: every level is built from a seed derived from (run seed + level number) with Math.random swapped
+ *    for the shared seeded generator, so every player builds the IDENTICAL level.
+ *  - PAUSE / UPGRADE SCREEN: a paused player is shown to the others as a faded, invulnerable ghost that falls to
+ *    the ground instead of floating, and mobs ignore it.
+ *  - simulation.cycle is nudged towards the host's so cycle-driven moving platforms stay in sync.
+ *  - Late join works whichever player has the smaller id.
+ *
+ * v5 features (kept)
+ *  - Level buttons are host-authoritative and account for every connected player's ghost position.
+ *  - Guests no longer create runtime enemies independently; the host replicates enemy spawn/death events.
+ *  - Enemy roster reconciliation compares stable mob IDs, not only enemy counts.
+ *  - Host snapshots include shared level bodies, including static doors moved with setPosition().
+ *  - Level custom-layer random effects use a per-run/per-level/per-cycle deterministic stream.
+ *
+ * v6 (this version): the two sets of features now work together
+ *  - The player you joined stays the session host (v5), BUT if the host pauses / opens the upgrade screen / hides the
+ *    tab for more than half a second, the host role moves to a non-paused player, so one player can no longer freeze
+ *    the mobs, doors and buttons for everybody. It moves back as soon as the preferred host is active again.
+ *  - Host messages are accepted from whoever is the current host, so role changes never drop packets.
+ *  - A new host re-publishes all button states so doors don't get stuck after a hand-over.
+ *
+ * v7: support for newer n-gon builds (written from the new index.html; every new hook is feature-detected,
+ *     run ngonMP.diag() in the console to see which hooks were found in your build)
+ *  - Training mode is a private solo run: nothing is synced and nobody else is pulled into it.
+ *  - Checkpoints (continue / import file / import code): only the host can load one; guests are told so. When the host
+ *    finishes loading, everybody restarts from the same seed and catches up to the same level ("resync").
+ *  - Level editor is blocked while connected (local levels differ per player).
+ *  - Level pool / local levels: the host sends which level it is on; a player whose level order differs gets a warning.
+ *  - level.start() may now finish asynchronously (local levels with code): the shared seeding and "level built" step
+ *    wait for it to finish.
+ *  - Moving/breaking level geometry is synced generically: every static map body gets an id, the host streams the
+ *    ones that move (doors, platforms, lifts from any level element) and which ones were destroyed, so levels built
+ *    by the new level-elements system stay in sync even if its API differs from the old level.button().
+ *  - The cycle nudge is skipped when players use different "limit frames per second" settings.
+ */
+(function () {
+    'use strict';
+    if (window.__ngonMP) return;
+    window.__ngonMP = true;
+
+    const DEBUG = false;
+    const CFG = {
+        tickMs: 50,          // network send rate (20 Hz)
+        interpMs: 100,       // render delay for interpolation
+        maxBullets: 150,
+        pvpScale: 0.01,
+        syncCycle: true,     // keep simulation.cycle close to the host (moving platforms etc.)
+        staleMs: 1500,       // no state packet for this long => treat peer as paused
+        maxMsgPerSec: 900,   // per peer; the normal rate is a few dozen packets per second
+        maxPeers: 12,
+        maxPktBytes: 9000,   // one state packet never exceeds this (roughly, JSON size); the least important parts are dropped first
+        hostPauseMs: 500,    // a player must be paused this long before the host role moves away from them
+        peerjsSrc: 'https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js',
+    };
+    const NOOP = function () { };
+    const SKIP_SPAWN = /^(mapRect|mapVertex|mapRectNow|mapVertexNow|bodyRect|bodyVertex|bodyRectCorner|debris|pickList|fullPickList|setMobTypeSpawnOrder|setSpawnList|randomizeSpawnList|dmg\w*|mobDmg\w*|props\w*|spawnBuilding|spawnStairs|addResearchToLevel|sandPaper)$/;
+    const PUPPET_NOOPS = ['locatePlayer', 'seePlayerCheck', 'seePlayerByLookingAt', 'seePlayerByHistory', 'seePlayerCheckByDistance', 'seePlayerByDistOrLOS', 'alwaysSeePlayer', 'alertNearByMobs', 'attraction', 'repulsion', 'gravity'];
+
+    // ---- helpers (NOTE: never use Math.random here, n-gon seeds it and we must not disturb the RNG) ----
+    const q = (v, k = 1) => Number.isFinite(v) ? Math.round(v * k) : 0;
+    const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    const now = () => performance.now();
+    const log = (...a) => { if (DEBUG) console.log('[MP]', ...a); };
+    function lerpAngle(a, b2, t) { let d = b2 - a; while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; return a + d * t; }
+    const stepMs = () => (typeof simulation !== 'undefined' && Number.isFinite(simulation.fpsInterval) && simulation.fpsInterval > 0) ? simulation.fpsInterval : 1000 / 72;
+    function sample(buf, t) {
+        const n = buf.length; if (!n) return null;
+        if (t <= buf[0].t) return buf[0];
+        for (let i = 0; i < n - 1; i++) {
+            const A = buf[i], B = buf[i + 1];
+            if (t >= A.t && t <= B.t) {
+                const k = (t - A.t) / Math.max(1, B.t - A.t);
+                return { x: A.x + (B.x - A.x) * k, y: A.y + (B.y - A.y) * k, vx: B.vx, vy: B.vy, a: lerpAngle(A.a, B.a, k) };
+            }
+        }
+        const L = buf[n - 1]; const fr = Math.max(0, Math.min(8, (t - L.t) / stepMs()));
+        return { x: L.x + L.vx * fr, y: L.y + L.vy * fr, vx: L.vx, vy: L.vy, a: L.a };
+    }
+
+    const rnd = () => crypto.getRandomValues(new Uint32Array(1))[0];
+    const errCount = {};
+    function guard(name, fn) {
+        return function () {
+            if ((errCount[name] | 0) >= 500) return undefined;
+            try { return fn.apply(this, arguments); }
+            catch (e) {
+                const n = errCount[name] = (errCount[name] | 0) + 1;
+                if (n <= 3) console.warn('[MP] error in ' + name + ':', e);
+                if (n === 500) console.warn('[MP] ' + name + ' switched off after repeated errors');
+                return undefined;
+            }
+        };
+    }
+    const HOOKS = {};   // label -> true/false (was the function found in this n-gon build?)  see ngonMP.diag()
+    function wrapFn(obj, key, label, make) {
+        const orig = obj && obj[key];
+        if (typeof orig !== 'function') { HOOKS[label] = false; console.warn('[MP] ' + label + ' not found in this build - that part of the mod is skipped'); return false; }
+        if (orig._mpw) return true;
+        HOOKS[label] = true;
+        const w = make(orig); w._mpw = true; obj[key] = w; return true;
+    }
+
+    const NEEDED = ['simulation', 'level', 'm', 'mobs', 'spawn', 'Matter', 'b', 'engine', 'cat', 'mob', 'body', 'bullet', 'powerUp', 'powerUps', 'map', 'ctx'];
+    function missingGlobals() {
+        return NEEDED.filter(n => { try { return (0, eval)('typeof ' + n) === 'undefined'; } catch (e) { return false; } });
+    }
+    function whenReady(cb) {
+        let tries = 0;
+        const t = setInterval(() => {
+            tries++;
+            const miss = missingGlobals();
+            if (!miss.length) { clearInterval(t); cb(); }
+            else if (tries === 100) console.warn('[MP] still waiting for the game to load, missing: ' + miss.join(', '));
+        }, 200);
+    }
+    function loadPeer(cb) {
+        if (typeof Peer !== 'undefined') return cb();
+        const s = document.createElement('script'); s.src = CFG.peerjsSrc; s.onload = cb;
+        s.onerror = () => console.error('[MP] failed to load PeerJS (blocked by an extension or network?)'); document.head.appendChild(s);
+    }
+
+    function init() {
+        const Body = Matter.Body, Composite = Matter.Composite, Bodies = Matter.Bodies;
+        const LC = () => (level.levelsCleared | 0);
+
+        const S = {
+            id: null, hostId: null, sessionHostId: null, isHost: true,
+            name: localStorage.getItem('p2pUsername') || 'player',
+            peers: new Map(),
+            together: true, pvp: false, room: { max: 8, ask: true },
+            forceLocalNext: false, hostAction: false, lvlReqLc: -1, lvlReqAt: 0,
+            inGame: false, loading: false, applying: false, replay: false, inPuppet: false,
+            replayNew: [], grp: 0, ctr: 0, tickN: 0,
+            aliveIds: null, mc: null,
+            catchTarget: -1, catchRunning: false,
+            runSeed: null, remotePending: false,
+            paused: false, pausedAt: 0, stuck: 0, lastCycle: -1, hostCy: null,
+            dmgSeq: 0, fxSeq: 0, mfxSeq: 0, epoch: (crypto.getRandomValues(new Uint32Array(1))[0]).toString(36), sendSeq: 0, dead: false, deadLc: -1, deadAt: 0, revivedLc: -1, revAuth: -1, forceDeath: false, reviveTimer: null,
+            buttons: Object.create(null), buttonSeq: 0, buttonSent: new Map(), remoteButtons: new Map(),
+            buildingLevel: false, lastRosterAt: 0, lastButtonSnapshotAt: 0,
+            solo: false, savePending: false, saveStarted: false, saveWatching: false, olWarned: -1, forceLv: null, forceFlip: null, forceDf: null,
+            mapIds: null, mapSent: new Map(), mapBase: new Map(),
+        };
+        const ghosts = new Map();       // peerId -> ghost mob
+        const mobMap = new Map();       // netId -> mob
+        const bodyMap = new Map();      // netId -> block
+        const puMap = new Map();        // pid -> powerUp
+        let spawnQ = [], deathQ = [], opsQ = [], dropQ = [], ownPuQ = [];
+        let bodySnapshotSeen = null;
+        const dmgOut = new Map();       // netId -> [dmg, pierce]
+        let fxQ = [];                    // explosion visuals to mirror on the other players' screens
+        const pvpOut = new Map();       // peerId -> dmg
+
+        // ------------------------------------------------------------------ networking
+        const PREFIX = 'ngonmp-', LOBBY_ID = 'ngonmp_lobby_v1';
+        const slug = s => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 24);
+        const sessionSuffix = (() => {
+            try {
+                const bytes = new Uint8Array(8);
+                crypto.getRandomValues(bytes);
+                return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+            } catch (e) {
+                // Use a per-page-session suffix; never change it between ID collision retries.
+                return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+            }
+        })();
+        const idFor = (name, n) => PREFIX + (slug(name) || 'player') + '-' + sessionSuffix + (n > 1 ? '-' + n : '');
+        const validId = id => typeof id === 'string' && /^[\w-]{1,64}$/.test(id);
+        const cleanName = s => String(s == null ? '' : s).replace(/[\u0000-\u001f<>]/g, '').trim().slice(0, 20);
+        let peer = null, peerGen = 0;
+        S.baseName = cleanName(localStorage.getItem('p2pUsername')) || ('player' + (rnd() % 9000 + 1000));
+        S.name = S.baseName;
+
+        function openPeers() { const r = []; for (const p of S.peers.values()) if (p.ev && p.ev.open) r.push(p); return r; }
+        function teardown() {
+            S.tearing = true;
+            try {
+                for (const p of [...S.peers.values()]) {
+                    try { removeGhost(p.id); } catch (e) { }
+                    try { if (p.ev) p.ev.close(); } catch (e) { }
+                    try { if (p.st) p.st.close(); } catch (e) { }
+                }
+                S.peers.clear();
+                closeLobby();
+                clearReconnects();
+                approvedPeers.clear();
+                try { if (peer) peer.destroy(); } catch (e) { }
+            } finally { S.tearing = false; }
+            peer = null; S.id = null; S.hostId = null; S.sessionHostId = null; S.isHost = true; S.firstRole = undefined;
+        }
+        function startPeer(name) {
+            const gen = ++peerGen;
+            S.baseName = cleanName(name) || S.baseName;
+            S.name = S.baseName;
+            teardown();
+            ui.status('connecting to network...');
+            let attempt = 1, waited = false;
+            const tryOpen = () => {
+                if (gen !== peerGen) return;
+                const p = new Peer(idFor(S.baseName, attempt), { debug: 1 });
+                peer = p; let opened = false;
+                p.on('open', id => {
+                    if (gen !== peerGen) { try { p.destroy(); } catch (e) { } return; }
+                    opened = true; S.id = id; S.hostId = id; S.sessionHostId = id; S.firstRole = undefined;
+                    S.name = attempt > 1 ? S.baseName + ' ' + attempt : S.baseName;
+                    ui.setId(id); ui.status('online as ' + S.name + (attempt > 1 ? ' (name was taken)' : ''));
+                    refreshRole(); connectLobby();
+                });
+                p.on('connection', c => { if (c.label === 'lobby') { try { c.close(); } catch (e) { } return; } if (c.label === 'mp-control') { handleControl(c); return; } if (!approvedPeers.has(c.peer)) { try { c.close(); } catch (e) {} return; } attach(c, false); });
+                p.on('error', e => {
+                    if (gen !== peerGen) return;
+                    const type = e && e.type;
+                    if (type === 'unavailable-id' && !opened) {
+                        try { p.destroy(); } catch (er) { }
+                        if (!waited) { waited = true; setTimeout(tryOpen, 2500); }
+                        else if (++attempt <= 20) tryOpen();
+                        else ui.status('could not get a free name, pick another');
+                        return;
+                    }
+                    if (type === 'peer-unavailable') { onUnavailable(e); return; }
+                    ui.status('network: ' + (type || e));
+                });
+                let reconnecting = false;
+                p.on('disconnected', () => {
+                    if (gen !== peerGen || p.destroyed || reconnecting) return;
+                    reconnecting = true;
+                    // The data channels may survive, but the signaling socket is needed for new joins.
+                    try { if (hubConn) hubConn.close(); } catch (e) { }
+                    if (hubConn) hubConn = null;
+                    try { p.reconnect(); } catch (e) { reconnecting = false; }
+                });
+                p.on('open', () => {
+                    if (gen !== peerGen) return;
+                    reconnecting = false;
+                    if (S.id && !S.tearing) {
+                        if (hubConn && !hubConn.open) { try { hubConn.close(); } catch (e) { } hubConn = null; }
+                        scheduleLobby(250);
+                    }
+                });
+            };
+            tryOpen();
+        }
+        window.addEventListener('beforeunload', () => { S.tearing = true; try { closeLobby(); clearReconnects(); if (peer) peer.destroy(); } catch (e) { } });
+
+        const pendingJoin = new Map();
+        function joinByName(input) {
+            input = String(input || '').trim(); if (!input) return;
+            const lower = input.toLowerCase();
+            let target = null;
+            for (const u of dir.values()) if (u.name.toLowerCase() === lower || u.id === input) { target = u.id; break; }
+            if (!target) {
+                if (/^ngonmp[-_]/i.test(input) && validId(input)) target = input;
+                else {
+                    ui.status('player not found — choose them from the online list or enter their full Peer ID');
+                    return;
+                }
+            }
+            if (target === S.id) { ui.status('that is you'); return; }
+            requestJoin(target);
+        }
+        const controlPending = new Map();
+        const approvedPeers = new Set();
+        const reconnectAttempts = new Map(), reconnectTimers = new Map();
+        function clearReconnects() {
+            for (const timer of reconnectTimers.values()) clearTimeout(timer);
+            reconnectTimers.clear(); reconnectAttempts.clear();
+        }
+        function scheduleReconnect(id) {
+            if (!approvedPeers.has(id) || !S.id || S.tearing || !peer || reconnectTimers.has(id)) return;
+            const attempt = reconnectAttempts.get(id) || 0;
+            if (attempt >= 6) {
+                ui.notify('Connection lost', 'Could not reconnect to ' + (S.peers.get(id)?.name || id) + '. You can select them from the online list to try again.');
+                return;
+            }
+            const delay = Math.min(10000, 1000 * Math.pow(2, attempt));
+            const timer = setTimeout(() => {
+                reconnectTimers.delete(id);
+                if (!approvedPeers.has(id) || S.tearing || !peer || (S.peers.get(id) && S.peers.get(id).ev)) return;
+                reconnectAttempts.set(id, attempt + 1);
+                connectTo(id);
+            }, delay);
+            reconnectTimers.set(id, timer);
+        }
+        function sendControl(target, payload) {
+            if (!peer || !S.id || !validId(target) || target === S.id) return;
+            let c;
+            try { c = peer.connect(target, { label: 'mp-control', reliable: true }); }
+            catch (e) { ui.status('could not contact that player'); return; }
+            const timer = setTimeout(() => { try { c.close(); } catch (e) {} }, 12000);
+            c.on('open', () => { try { c.send({ ...payload, from: S.id, name: S.name }); } catch (e) {} });
+            c.on('data', d => {
+                if (!d || d.t !== 'control-result') return;
+                clearTimeout(timer); try { c.close(); } catch (e) {}
+                if (d.ok && payload.t === 'join-request') {
+                    approvedPeers.add(target);
+                    S.sessionHostId = target; S.hostId = target; S.isHost = false; S.firstRole = undefined;
+                    ui.status('request accepted — connecting...'); connectTo(target);
+                } else if (d.ok && payload.t === 'invite') {
+                    approvedPeers.add(target);
+                    ui.notify('Invitation sent', 'Waiting for ' + (payload.targetName || 'the player') + ' to respond.');
+                } else if (!d.ok) ui.notify('Request declined', d.reason || 'The player declined the request.');
+            });
+            c.on('error', () => { clearTimeout(timer); ui.notify('Player unavailable', 'Could not reach that player.'); });
+            c.on('close', () => clearTimeout(timer));
+        }
+        function requestJoin(target) {
+            if (!target || target === S.id) return;
+            ui.status('sending join request...');
+            sendControl(target, { t: 'join-request' });
+        }
+        function invitePlayer(target, targetName) {
+            if (!target || target === S.id) return;
+            sendControl(target, { t: 'invite', targetName: targetName || 'player' });
+            ui.status('sending invitation...');
+        }
+        function handleControl(c) {
+            c.on('data', d => {
+                if (!d || typeof d !== 'object') return;
+                const from = String(d.from || c.peer || '');
+                const who = cleanName(d.name) || 'A player';
+                if (d.t === 'join-request' || d.t === 'invite') {
+                    const isInvite = d.t === 'invite';
+                    if (!isInvite && openPeers().length + 1 >= S.room.max) { try { c.send({ t: 'control-result', ok: false, reason: 'The room is full.' }); } catch (e) { } return; }
+                    if (!isInvite && !S.room.ask && (S.isHost || !hasPeers())) { approvedPeers.add(from); try { c.send({ t: 'control-result', ok: true }); } catch (e) { } return; }
+                    ui.notify(isInvite ? 'Multiplayer invitation' : 'Join request',
+                        who + (isInvite ? ' invited you to play.' : ' wants to join your session.'),
+                        () => {
+                            approvedPeers.add(from);
+                            try { c.send({ t: 'control-result', ok: true }); } catch (e) {}
+                            if (isInvite) {
+                                S.sessionHostId = from; S.hostId = from; S.isHost = false; S.firstRole = undefined;
+                                ui.status('joining ' + who + '...'); connectTo(from);
+                            }
+                        },
+                        () => { try { c.send({ t: 'control-result', ok: false, reason: 'The request was declined.' }); } catch (e) {} }
+                    );
+                }
+            });
+            c.on('error', () => {});
+        }
+        function onUnavailable(e) {
+            const message = String((e && e.message) || '');
+            const mt = /peer\s+(\S+)/i.exec(message); const id = mt && mt[1];
+            if (id === LOBBY_ID || message.includes(LOBBY_ID)) { lobbyMissing(); return; }
+            if (!id) { ui.status('player not found'); return; }
+            const sp = S.peers.get(id); if (sp && !(sp.ev && sp.ev.open)) S.peers.delete(id);
+            if (pendingJoin.has(id)) { const alt = pendingJoin.get(id); pendingJoin.delete(id); connectTo(alt); return; }
+            if (approvedPeers.has(id)) { scheduleReconnect(id); return; }
+            ui.status('could not find "' + id.replace(PREFIX, '') + '" (are they online?)');
+        }
+
+        // ------------------------------------------------------------------ online directory (lobby)
+        const dir = new Map();          // id -> {id,name,g,lc,n}
+        let hub = null, hubConn = null, hubTimer = null, hubStarting = false, lastReg = '', lastRegAt = 0, lastDirAt = 0, lastLobbyTry = 0;
+        const myInfo = () => ({ id: S.id, name: S.name, g: S.inGame ? 1 : 0, lc: LC(), n: openPeers().length });
+        function setDir(list) {
+            lastDirAt = now();
+            dir.clear();
+            for (const e of list || []) {
+                if (!Array.isArray(e) || !validId(e[0])) continue;
+                dir.set(e[0], { id: e[0], name: cleanName(e[1]) || 'player', g: e[2] ? 1 : 0, lc: e[3] | 0, n: e[4] | 0 });
+            }
+            ui.refreshDir();
+        }
+        function connectLobby() {
+            if (!peer || !S.id || hub) return;
+            if (hubConn && hubConn.open) return;
+            const gen = peerGen; lastLobbyTry = now();
+            let c;
+            try { c = peer.connect(LOBBY_ID, { label: 'lobby', reliable: true }); } catch (e) { scheduleLobby(); return; }
+            hubConn = c;
+            c.on('open', () => { lastReg = ''; sendReg(); });
+            c.on('data', d => { if (d && d.t === 'dir' && Array.isArray(d.l)) setDir(d.l); });
+            c.on('close', () => { if (hubConn === c) { hubConn = null; if (gen === peerGen && !S.tearing) scheduleLobby(); } });
+            c.on('error', e => {
+                if (hubConn === c) hubConn = null;
+                if (gen === peerGen && !S.tearing && e && e.type === 'peer-unavailable') lobbyMissing();
+                else if (gen === peerGen && !S.tearing) scheduleLobby(1200);
+            });
+        }
+        function scheduleLobby(ms) {
+            clearTimeout(hubTimer);
+            hubTimer = setTimeout(() => { if (S.id && !hub && !(hubConn && hubConn.open)) connectLobby(); }, ms != null ? ms : 1200 + rnd() % 1800);
+        }
+        function sendReg() {
+            const info = myInfo(), key = [info.name, info.g, info.lc, info.n].join('|'), t = now();
+            if (hub) { hub.set(info); return; }
+            if (!hubConn || !hubConn.open) return;
+            if (key === lastReg && t - lastRegAt < 5000) return;
+            lastReg = key; lastRegAt = t;
+            try { hubConn.send({ t: 'reg', name: info.name, g: info.g, lc: info.lc, n: info.n }); } catch (e) { }
+        }
+        function lobbyMissing() {
+            hubConn = null;
+            if (hub || hubStarting || !S.id || !peer) return;
+            const gen = peerGen;
+            let hp;
+            hubStarting = true;
+            try { hp = new Peer(LOBBY_ID, { debug: 0 }); } catch (e) { hubStarting = false; scheduleLobby(); return; }
+            const users = new Map(), conns = new Map(); let dirty = false, timer = null, up = false, beat = 0;
+            const api = {
+                peer: hp,
+                set(info) {
+                    if (!info.id) return;
+                    const o = users.get(info.id), k = o ? [o.name, o.g, o.lc, o.n].join('|') : '';
+                    users.set(info.id, { ...info, t: now() });
+                    if (k !== [info.name, info.g, info.lc, info.n].join('|')) dirty = true;
+                },
+                push() {
+                    const l = [...users.values()].map(u => [u.id, u.name, u.g, u.lc, u.n]);
+                    for (const c of conns.values()) { try { if (c.open) c.send({ t: 'dir', l }); } catch (e) { } }
+                    setDir(l);
+                },
+                stop() { clearInterval(timer); try { hp.destroy(); } catch (e) { } if (hub === api) hub = null; }
+            };
+            hp.on('open', () => {
+                if (gen !== peerGen) { try { hp.destroy(); } catch (e) { } return; }
+                up = true; hubStarting = false; hub = api; clearTimeout(hubTimer);
+                api.set(myInfo()); api.push();
+                timer = setInterval(() => {
+                    const t = now();
+                    for (const [id, u] of users) if (id !== S.id && t - u.t > 20000) { users.delete(id); dirty = true; }
+                    api.set(myInfo());
+                    if (dirty || ++beat % 3 === 0) { dirty = false; api.push(); }        // a regular heartbeat even when nothing changed, so clients can tell a dead link from a quiet one
+                }, 2000);
+            });
+            hp.on('connection', c => {
+                conns.set(c.peer, c);
+                c.on('data', d => {
+                    if (!d || d.t !== 'reg') return;
+                    api.set({ id: c.peer, name: cleanName(d.name) || 'player', g: d.g ? 1 : 0, lc: d.lc | 0, n: d.n | 0 });
+                    if (dirty) { dirty = false; api.push(); }
+                });
+                c.on('close', () => { conns.delete(c.peer); if (users.delete(c.peer)) { dirty = false; api.push(); } });
+                c.on('error', () => { });
+                c.on('open', () => { try { c.send({ t: 'dir', l: [...users.values()].map(u => [u.id, u.name, u.g, u.lc, u.n]) }); } catch (e) { } });
+            });
+            hp.on('error', e => {
+                if (!up) { hubStarting = false; try { hp.destroy(); } catch (er) { } if (gen === peerGen) scheduleLobby(300 + rnd() % 700); }
+            });
+            hp.on('disconnected', () => { try { if (!hp.destroyed) hp.reconnect(); } catch (e) { } });
+            hp.on('close', () => { clearInterval(timer); hubStarting = false; if (hub === api) { hub = null; if (gen === peerGen && !S.tearing) scheduleLobby(); } });
+        }
+        function closeLobby() {
+            clearTimeout(hubTimer);
+            if (hub) { const h = hub; hub = null; h.stop(); }
+            try { if (hubConn) hubConn.close(); } catch (e) { }
+            hubConn = null; dir.clear();
+        }
+        setInterval(guard('lobbyBeat', () => {
+            if (!S.id || S.tearing) return;
+            sendReg();
+            // watchdog: "they see me but I don't see them" happens when the link to the directory is half dead. Rebuild it.
+            if (!hub) {
+                if (hubConn && hubConn.open) { if (now() - lastDirAt > 13000) { try { hubConn.close(); } catch (e) { } hubConn = null; scheduleLobby(150); } }
+                else if (now() - lastLobbyTry > 5000) connectLobby();
+            }
+        }), 1000);
+
+        function newPeer(id) {
+            const p = { id, name: 'player', ev: null, st: null, buf: [], lc: -1, pvp: false, alive: false, bl: null, blAt: 0, hello: false, cur: null, hue: 0, paused: false, pausedAt: 0, seenAt: now(), fy: undefined, fv: 0 };
+            let h = 0; for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) % 360; p.hue = h;
+            S.peers.set(id, p); return p;
+        }
+        // a peer counts as paused when it says so, or when it stopped sending state (hidden tab, frozen page)
+        const peerPaused = p => !!(p.paused || now() - p.seenAt > CFG.staleMs);
+        // ...but the host role only moves away after the pause has lasted a while (avoids flapping during level loads)
+        const peerHostPaused = p => (p.paused && now() - p.pausedAt > CFG.hostPauseMs) || now() - p.seenAt > CFG.staleMs;
+        const meHostPaused = () => S.paused && now() - S.pausedAt > CFG.hostPauseMs;
+        function connectTo(id) {
+            id = String(id || '').trim();
+            if (!validId(id) || !peer || !S.id || id === S.id || id === LOBBY_ID || S.tearing) return;
+            const p = S.peers.get(id);
+            if (p && p.ev) return; // one control channel attempt per peer at a time
+            try {
+                attach(peer.connect(id, { label: 'ev', reliable: true }), true);
+                attach(peer.connect(id, { label: 'st', reliable: false }), true);
+            } catch (e) {
+                ui.status('connect failed');
+                if (approvedPeers.has(id)) scheduleReconnect(id);
+            }
+        }
+        function attach(c, outgoing) {
+            const pid = c.peer; const slot = c.label === 'st' ? 'st' : 'ev';
+            const initiator = outgoing ? S.id : pid; c._init = initiator;
+            if (!S.peers.has(pid) && S.peers.size + 1 >= Math.min(CFG.maxPeers, S.room.max)) { try { c.close(); } catch (e) { } return; }
+            const p = S.peers.get(pid) || newPeer(pid);
+            const cur = p[slot];
+            const curDead = cur && cur._was && !cur.open;                          // opened once, closed since: not a real duplicate
+            if (cur && cur !== c && !curDead) { // duplicate (open OR still connecting): keep the one initiated by the smaller id, so both sides agree
+                if (cur._init <= initiator) { try { c.close(); } catch (e) { } return; }
+                try { cur.close(); } catch (e) { }
+            }
+            p[slot] = c;
+            c.on('open', () => { c._was = true; });
+            c.on('data', d => { if (p[slot] !== c || S.peers.get(pid) !== p) return; onDataSafe(p, d); });   // stale / replaced connection or removed peer
+            c.on('close', () => { if (S.tearing) return; if (p[slot] === c) { p[slot] = null; if (slot === 'ev') dropPeer(p); } });
+            c.on('error', () => {
+                if (S.tearing || p[slot] !== c) return;
+                p[slot] = null;
+                if (slot === 'ev') dropPeer(p);
+            });
+            const opened = () => {
+                if (slot === 'ev') {
+                    const timer = reconnectTimers.get(pid); if (timer) clearTimeout(timer);
+                    reconnectTimers.delete(pid); reconnectAttempts.delete(pid);
+                    sendHello(p);
+                }
+                ui.refresh();
+            };
+            if (c.open) opened(); else c.on('open', opened);
+        }
+        function dropPeer(p) {
+            removeGhost(p.id);
+            try { if (p.st) p.st.close(); } catch (e) { }
+            S.peers.delete(p.id);
+            // If a guest owned a shared object when they disconnected, transfer it
+            // to the current host so it continues to be simulated and replicated.
+            if (S.isHost && !S.solo) {
+                for (const bd of bodyMap.values()) if (bd && bd._owner === p.id) {
+                    bd._owner = S.id;
+                    if (bd._nid) opsQ.push(['c', bd._nid]);
+                }
+            }
+            say(p.name + ' left');
+            refreshRole(); ui.refresh();
+            if (approvedPeers.has(p.id)) scheduleReconnect(p.id);
+        }
+        function sendEv(msg, to) {
+            for (const p of S.peers.values()) {
+                if (to && p.id !== to) continue;
+                if (p.ev && p.ev.open) { try { p.ev.send(msg); } catch (e) { } }
+            }
+        }
+        function sendSt(msg) {
+            for (const p of S.peers.values()) {
+                const c = (p.st && p.st.open) ? p.st : ((p.ev && p.ev.open) ? p.ev : null);
+                if (c) { try { c.send(msg); } catch (e) { } }
+            }
+        }
+        const hasPeers = () => { for (const p of S.peers.values()) if (p.ev && p.ev.open) return true; return false; };
+
+        function sendHello(p) {
+            sendEv({ t: 'hello', name: S.name, hostId: (S.sessionHostId || S.hostId || S.id), seed: S.inGame ? (S.runSeed != null ? S.runSeed : getSeed()) : getSeed(), inGame: S.inGame && !S.solo, lc: LC(), pvp: S.pvp, dead: S.dead, ep: S.epoch, peers: [...S.peers.keys()], ...(S.inGame && !S.solo ? lvInfo() : {}) }, p.id);
+            refreshRole();
+        }
+
+        // ------------------------------------------------------------------ roles
+        // The player you joined is the preferred host (sessionHostId). While in a run, if the preferred host is paused
+        // (pause menu, upgrade screen, hidden tab, frozen page) for longer than CFG.hostPauseMs, the host role moves to the
+        // lowest-id active player, so a single paused player can't freeze mobs / doors / buttons for everybody.
+        // Every client computes this from the same information, so they agree on who the host is.
+        function computeHost() {
+            if (!S.id) return S.sessionHostId || S.hostId;
+            if (S.solo) return S.id;                                                  // training: private run, we are our own host
+            const open = openPeers();
+            const all = [S.id, ...open.map(p => p.id)].sort();
+            let pref = S.sessionHostId || S.hostId || S.id;
+            if (!all.includes(pref)) pref = all[0];                                   // preferred host left / not connected yet
+            if (!S.inGame) return pref;
+            const active = [];
+            if (!meHostPaused()) active.push(S.id);
+            for (const p of open) if (!peerHostPaused(p)) active.push(p.id);
+            if (!active.length) return pref;                                          // everybody paused: nothing to move
+            if (active.includes(pref)) return pref;
+            active.sort();
+            return active[0];
+        }
+        const isHostPeer = p => p.id === computeHost();                              // accept host messages from the CURRENT host
+        function refreshRole() {
+            if (!S.id) { ui.refresh(); return; }
+            const was = S.isHost, previousHost = S.hostId;
+            S.hostId = computeHost(); S.isHost = (S.hostId === S.id);
+            if (S.isHost && !was) {
+                for (const mo of mob) unpuppetize(mo);
+                // The former host may be paused or disconnected; take over its objects
+                // so their physics keeps advancing under the newly active host.
+                for (const bd of bodyMap.values()) if (bd && bd._owner && bd._owner !== S.id &&
+                    (bd._owner === previousHost || !S.peers.has(bd._owner))) {
+                    bd._owner = S.id;
+                    if (bd._nid) opsQ.push(['c', bd._nid]);
+                }
+                S.aliveIds = null;
+                S.buttonSent.clear();                                                // re-publish every button state as the new host
+                if (S.inGame && !S.loading && !S.solo) {
+                    scanWorld();
+                    sendMobRoster();
+                    sendMapSnapshot();
+                    sendBodySnapshot();
+                    sendButtonSnapshot();
+                }
+            } else if (!S.isHost && (was || S.firstRole === undefined)) {
+                for (const mo of mob) puppetize(mo);
+                if (S.inGame && S.firstRole === undefined) sendEv({ t: 'mreq', lc: LC() }, S.hostId);   // only the first time; later swaps keep the mobs we already have
+            }
+            S.firstRole = true;
+            ui.refresh();
+        }
+
+        // ------------------------------------------------------------------ message handlers
+        const H = {};
+        // Every packet is untrusted: wrong shapes, oversized arrays/strings and floods are dropped before any handler sees them.
+        const MAXARR = 3000, MAXSTR = 20000;
+        function packetOk(d) {
+            if (typeof d.t !== 'string' || d.t.length > 12 || !Object.prototype.hasOwnProperty.call(H, d.t)) return false;
+            let n = 0;
+            for (const k in d) {
+                const v = d[k]; n++;
+                if (n > 40) return false;
+                if (typeof v === 'string') { if (v.length > MAXSTR) return false; }
+                else if (Array.isArray(v)) { if (v.length > MAXARR) return false; }
+                else if (typeof v === 'function') return false;
+            }
+            return true;
+        }
+        function onData(p, d) {
+            if (!d || typeof d !== 'object' || Array.isArray(d)) return;
+            const t = now();
+            if (!p._rl || t - p._rl.t0 > 1000) p._rl = { t0: t, n: 0, bad: p._rl ? p._rl.bad : 0 };
+            if (++p._rl.n > CFG.maxMsgPerSec) { if (p._rl.n === CFG.maxMsgPerSec + 1 && (errCount.flood = (errCount.flood | 0) + 1) <= 3) console.warn('[MP] flood from', p.name, '- dropping packets'); return; }
+            if (!packetOk(d)) { if ((p._rl.bad = (p._rl.bad | 0) + 1) > 200) { try { p.ev && p.ev.close(); } catch (e) { } } return; }
+            S.netCtx = (S.netCtx | 0) + 1; try { H[d.t](p, d); } finally { S.netCtx--; }
+        }
+        const onDataSafe = guard('net.data', onData);
+
+        H.hello = (p, d) => {
+            if (S.isHost) setTimeout(() => sendRoom(p.id), 400);
+            p.name = String(d.name || 'player').slice(0, 20); p.hello = true; p.pvp = d.pvp === true; p.seenAt = now(); p.dead = d.dead === true;
+            if (typeof d.ep === 'string' && d.ep !== p.ep) { p.ep = d.ep; p.lastSeq = -1; p.offMin = null; p.buf = []; }
+            if (!S.inGame && d.hostId && (p.id === S.sessionHostId || !S.sessionHostId)) { S.sessionHostId = String(d.hostId); S.hostId = S.sessionHostId; }
+            // Peer connections are now permission-based; never auto-connect from a peer roster.
+            if (d.inGame && !S.inGame && !S.loading && !S.starting) {          // they are already in a run: join it (whoever has the smaller id), then catch up
+                if (d.seed == null) return;
+                S.runSeed = String(d.seed);
+                S.catchTarget = Math.max(0, d.lc | 0);
+                beginRun(S.runSeed, d.lv, d.fl, d.df);
+            } else if (!S.inGame && !d.inGame && p.id === (S.sessionHostId || S.hostId) && d.seed != null) {
+                setSeed(String(d.seed));                                        // the joined session host supplies the lobby seed
+            } else if (d.inGame && S.inGame && S.together && (d.lc | 0) !== LC()) {
+                if ((d.lc | 0) > LC()) syncToLevel(d.lc | 0);
+            }
+            refreshRole();
+            if (S.isHost && S.inGame && !S.solo && d.inGame) {
+                if ((d.lc | 0) !== LC()) {
+                    sendEv({ t: 'resync', seed: S.runSeed, lc: LC(), ...lvInfo() }, p.id);
+                } else {
+                    scanWorld();
+                    sendMobRoster(p.id);
+                    sendMapSnapshot(p.id);
+                    sendBodySnapshot(p.id);
+                    sendButtonSnapshot(p.id);
+                }
+            } else if (!S.isHost && S.inGame && d.inGame && (d.lc | 0) === LC()) {
+                // A reconnected guest may still be on the right level but have missed
+                // mob/object mutations while offline; request a fresh authoritative snapshot.
+                sendEv({ t: 'mreq', lc: LC() }, S.hostId || p.id);
+            }
+            say(p.name + ' joined');
+            ui.refresh();
+        };
+        H.peers = () => {}; // legacy roster packets cannot bypass join approval
+        H.dead = (p, d) => { if (S.peers.has(p.id)) { p.dead = true; p.alive = false; } };
+        H.revived = (p, d) => { if (S.peers.has(p.id)) { p.dead = false; p.alive = true; } };
+        H.rev = (p, d) => {              // the host revives eliminated players when a level begins
+            if (!isHostPeer(p) || S.solo || !Number.isFinite(Number(d.lc)) || !Array.isArray(d.ids)) return;
+            if (!d.ids.includes(S.id)) return;
+            S.revAuth = Math.max(S.revAuth, d.lc | 0);
+            tryRevive();
+        };
+        H.seed = (p, d) => { if (isHostPeer(p) && !S.inGame && d.seed != null) setSeed(String(d.seed)); };
+        // Only the deterministic lobby leader may start a shared run.
+        H.startReq = (p, d) => {
+            if (!S.isHost || S.inGame || S.loading || S.starting) return;
+            if (d && d.exp && typeof build !== 'undefined' && typeof build.reset === 'function') { try { openBuildMenu(); } catch (e) { simulation.startGame(); } return; }   // experimental mode: everyone opens their own build menu
+            simulation.startGame();
+        };
+        H.start = (p, d) => {
+            if (!isHostPeer(p) || S.inGame || S.loading || S.starting || d.seed == null) return;
+            S.runSeed = String(d.seed);
+            beginRun(S.runSeed, d.lv, d.fl, d.df, !!d.exp);
+        };
+        H.lvl = (p, d) => {
+            if (!S.together || !S.inGame || S.solo || !Number.isFinite(Number(d.lc))) return;
+            const target = Math.max(0, d.lc | 0);
+            if (LC() < target) syncToLevel(target);
+        };
+        H.lvlReq = (p, d) => {
+            if (!S.isHost || S.solo || !S.together || !S.inGame || !S.peers.has(p.id) || !p.hello || p.dead) return;
+            if ((d.lc | 0) !== LC() || S.loading || simulation.clearNow || S.starting) return;   // stale request: that level change already happened
+            S.hostAction = true;
+            try { level.nextLevel(); } catch (e) { console.warn('[MP] level change for a guest failed', e); } finally { S.hostAction = false; }
+        };
+        H.resyncReq = (p, d) => {
+            if (!S.isHost || S.solo || !S.inGame || S.loading || !S.peers.has(p.id) || !p.hello) return;
+            if (now() - (p.resyncAt || 0) < 15000) return;
+            p.resyncAt = now();
+            sendEv({ t: 'resync', seed: S.runSeed, lc: LC(), ...lvInfo() }, p.id);
+        };
+        H.fx = (p, d) => {
+            if (!S.peers.has(p.id) || S.solo || S.paused || S.loading || (d.lc | 0) !== LC() || !Array.isArray(d.l)) return;
+            if (Number.isInteger(d.q)) { if (d.q <= (p.fxQ | 0)) return; p.fxQ = d.q; }
+            for (const e of d.l.slice(0, 12)) {
+                if (!Array.isArray(e)) continue;
+                const x = Number(e[0]), y = Number(e[1]), r = Number(e[2]), col = e[3];
+                if (![x, y, r].every(Number.isFinite) || r <= 0 || r > 3000 || Math.abs(x) > 1e7 || Math.abs(y) > 1e7) continue;
+                if (typeof col !== 'string' || col.length > 48 || !/^rgba?\([0-9., %]+\)$|^#[0-9a-fA-F]{3,8}$/.test(col)) continue;
+                try { simulation.drawList.push({ x, y, radius: r, color: col, time: simulation.drawTime }); } catch (er) { }   // visual only: damage is decided by the owner
+            }
+        };
+        H.chat = (p, d) => say(esc(p.name) + ': ' + esc(String(d.x || '').slice(0, 200)), true);
+        H.pvp = (p, d) => {
+            if (!S.peers.has(p.id) || !S.pvp || S.paused || !m.alive || (d.lc | 0) !== LC() || typeof m.takeDamage !== 'function' || !Number.isFinite(d.d)) return;
+            if (Number.isInteger(d.q)) { if (d.q <= (p.pvpQ | 0)) return; p.pvpQ = d.q; }      // a repeated / reordered damage packet must never hurt twice
+            if (S.dead || !p.alive || p.dead) return;                                              // eliminated players deal no damage
+            m.takeDamage(Math.max(0, Math.min(d.d, 2)));
+        };
+        H.mc = (p, d) => {
+            if (!isHostPeer(p) || S.isHost || S.solo) return;
+            // the host is on a different level than us at the same level count => our level pool / local levels / seed differ
+            if (d.ol != null && !S.loading && (d.lc | 0) === LC() && String(level.onLevel) !== String(d.ol) && S.olWarned !== LC()) {
+                S.olWarned = LC();
+                say('your level differs from the host - asking the host to resync you');
+                sendEv({ t: 'resyncReq' }, p.id);                                // the host restarts us on its exact level list
+            }
+            S.mc = d; checkMc();
+        };
+        H.resync = (p, d) => {            // host checkpoint/level mismatch: rebuild even if this client was already in a run
+            if (!isHostPeer(p) || S.solo || d.seed == null || !Number.isFinite(Number(d.lc))) return;
+            S.runSeed = String(d.seed); S.catchTarget = Math.max(0, d.lc | 0);
+            if (S.inGame) {
+                S.forceLv = Array.isArray(d.lv) ? d.lv.map(String).slice(0, 64) : null;
+                S.forceFlip = typeof d.fl === 'boolean' ? d.fl : null;
+                S.forceDf = cleanDiff(d.df);
+                startLocalGame(S.runSeed);
+            } else beginRun(S.runSeed, d.lv, d.fl, d.df);
+        };
+        H.mg = (p, d) => {                // map bodies destroyed by the host
+            if (S.isHost || !isHostPeer(p) || (d.lc | 0) !== LC() || !S.mapIds || !Array.isArray(d.l)) return;
+            for (const id of d.l.slice(0, 200)) {
+                const bd = S.mapIds.get(id); if (!bd) continue;
+                S.mapIds.delete(id);
+                try { Composite.remove(engine.world, bd); } catch (e) { }
+                const i = map.indexOf(bd); if (i !== -1) map.splice(i, 1);
+            }
+        };
+        H.maps = (p, d) => {
+            if (S.isHost || !isHostPeer(p) || (d.lc | 0) !== LC() || !Array.isArray(d.l)) return;
+            applyMapMovers(d.l);
+        };
+        H.mreq = (p, d) => {
+            if (!S.isHost || S.solo || !S.peers.has(p.id) || !p.hello) return;
+            const mobsNow = realMobs().filter(mo => mo.alive && mo._nid != null);
+            sendEv({ t: 'mfull', lc: LC(), l: buildSpawnEvents(mobsNow), ids: mobsNow.map(mo => mo._nid) }, p.id);
+            sendMapSnapshot(p.id);
+            sendBodySnapshot(p.id);
+            sendButtonSnapshot(p.id);
+        };
+        H.mfull = (p, d) => {
+            if (S.isHost || !isHostPeer(p) || (d.lc | 0) !== LC() || !Array.isArray(d.l)) return;
+            for (const mo of realMobs()) killSilently(mo);
+            mobMap.clear();                                   // entries of mobs the game already removed would make the replay skip them
+            applySpawnEvents(d.l.slice(0, 500));
+            S.mc = null;
+        };
+        H.sp = (p, d) => {
+            if (!S.isHost && isHostPeer(p) && (d.lc | 0) === LC() && Array.isArray(d.l)) applySpawnEvents(d.l.slice(0, 500));
+        };
+        H.md = (p, d) => {
+            if (S.isHost || !isHostPeer(p) || (d.lc | 0) !== LC() || !Array.isArray(d.l)) return;
+            for (const id of d.l.slice(0, 500)) {
+                if (typeof id !== 'string') continue;
+                const mo = mobMap.get(id); mobMap.delete(id);
+                if (!mo || !mo.alive) continue;
+                mo.isDropPowerUp = false;
+                S.inPuppet = true;
+                try { (mo._realDeath || mo.death).call(mo); } catch (e) { } finally { S.inPuppet = false; }
+                if (mo.alive) killSilently(mo);
+            }
+        };
+        // A remote press must go through the level's OWN check (`if (button.isUp) { query(); if (!button.isUp) doThing() }`), otherwise levels that
+        // react to a press (gravitron's flip, doors...) never run their action on this client. So a press is delivered to the next query call.
+        function applyRemoteButton(button, up, isEvent) {
+            if (!button) return;
+            if (up) { button._mpPending = false; button.isUp = true; return; }
+            if (button._mpPending) return;                                     // a press is already waiting for the level's next check
+            // only a live press EVENT counts as a press; a snapshot (level start, late join) just copies the state, it must never trigger a level action
+            if (isEvent && button.isUp && !level.isFlipping && simulation.cycle - (S.levelStartCycle | 0) > 120) { button._mpPending = true; button._mpPendingAt = now(); } else button.isUp = false;
+        }
+        H.btn = (p, d) => {
+            if (S.isHost || !isHostPeer(p) || (d.lc | 0) !== LC() || typeof d.i !== 'string' || d.i.length > 24) return;
+            const state = { up: !!d.up, cy: Number.isFinite(d.cy) ? d.cy : simulation.cycle };
+            S.remoteButtons.set(d.i, state);
+            applyRemoteButton(S.buttons[d.i], state.up, true);
+        };
+        H.btns = (p, d) => {
+            if (S.isHost || !isHostPeer(p) || (d.lc | 0) !== LC() || !Array.isArray(d.l)) return;
+            for (const e of d.l.slice(0, 300)) {
+                if (!Array.isArray(e) || typeof e[0] !== 'string' || e[0].length > 24) continue;
+                const state = { up: !!e[1], cy: Number.isFinite(d.cy) ? d.cy : simulation.cycle };
+                S.remoteButtons.set(e[0], state);
+                applyRemoteButton(S.buttons[e[0]], state.up);
+            }
+        };
+        H.dm = (p, d) => {
+            if (!S.isHost || S.solo || !S.peers.has(p.id) || (d.lc | 0) !== LC() || !Array.isArray(d.l)) return;
+            if (Number.isInteger(d.q)) { if (d.q <= (p.dmQ | 0)) return; p.dmQ = d.q; }
+            if (p.dead) return;
+            for (const e of d.l.slice(0, 120)) {
+                if (!Array.isArray(e) || typeof e[0] !== 'string' || !Number.isFinite(e[1])) continue;
+                const amount = Math.max(0, Math.min(100, e[1]));
+                const mo = mobMap.get(e[0]);
+                if (mo && mo.alive && !mo._puppet && amount > 0) { try { mo.damage(amount, !!e[2]); } catch (er) { } }
+            }
+        };
+        H.bk = (p, d) => {
+            if (S.solo || (d.lc | 0) !== LC() || !Array.isArray(d.l)) return;
+            const fromHost = isHostPeer(p);
+            if (!S.isHost && !fromHost) return;
+            const relay = [];
+            for (const op of d.l.slice(0, 120)) {
+                if (!Array.isArray(op) || typeof op[0] !== 'string') continue;
+                if (op[0] === 'a') {
+                    const desc = op[1];
+                    if (!Array.isArray(desc) || typeof desc[0] !== 'string' || !desc[0].startsWith('D' + LC() + '_')) continue;
+                    if (!fromHost && !desc[0].startsWith('D' + LC() + '_' + p.id + '_')) continue;
+                    const owner = fromHost && typeof op[2] === 'string' ? op[2] : p.id;
+                    const bd = createBody(desc);
+                    if (bd) { bd._owner = owner; if (S.isHost) relay.push(['a', desc, owner]); }
+                } else if (op[0] === 'r') {
+                    if (typeof op[1] !== 'string') continue;
+                    const bd = bodyMap.get(op[1]); if (!bd) continue;
+                    // ownership: only the owner may destroy a shared object, except that anything destroyed right next to the sender (explosions,
+                    // lasers, crushers) is accepted as well so a block cannot end up destroyed for one player and intact for the others
+                    if (!fromHost && bd._owner !== p.id) {
+                        const c = p.cur || (Array.isArray(p.buf) && p.buf.length ? p.buf[p.buf.length - 1] : null);
+                        const near = c && Number.isFinite(c.x) && Number.isFinite(c.y) && Math.hypot(bd.position.x - c.x, bd.position.y - c.y) < 1000;
+                        if (!near) continue;
+                    }
+                    bodyMap.delete(op[1]); bd._gone = true;
+                    Composite.remove(engine.world, bd); const i = body.indexOf(bd); if (i !== -1) body.splice(i, 1);
+                    if (S.isHost) relay.push(['r', op[1]]);
+                } else if (op[0] === 'c') {
+                    if (typeof op[1] !== 'string') continue;
+                    const bd = bodyMap.get(op[1]);
+                    if (bd && (fromHost || S.isHost)) {
+                        const owner = fromHost && typeof op[2] === 'string' ? op[2] : p.id;
+                        bd._owner = owner; bd._ownAt = now();
+                        if (S.isHost) relay.push(['c', op[1], owner]);
+                    }
+                }
+            }
+            // Guests send object operations to the host; relay only host-accepted changes
+            // so every other guest creates/removes/claims the same shared object.
+            if (S.isHost && relay.length) {
+                for (const peerId of S.peers.keys()) if (peerId !== p.id) sendEv({ t: 'bk', lc: LC(), l: relay }, peerId);
+            }
+        };
+        H.bfull = (p, d) => {
+            if (S.isHost || !isHostPeer(p) || S.solo || (d.lc | 0) !== LC()) return;
+            if (d.begin === true) bodySnapshotSeen = new Set();
+            if (Array.isArray(d.l)) {
+                if (!bodySnapshotSeen) bodySnapshotSeen = new Set();
+                for (const entry of d.l.slice(0, 60)) {
+                    if (!Array.isArray(entry) || !Array.isArray(entry[0])) continue;
+                    const desc = entry[0], owner = typeof entry[1] === 'string' ? entry[1] : null;
+                    if (typeof desc[0] !== 'string' || !desc[0].startsWith('D' + LC() + '_')) continue;
+                    bodySnapshotSeen.add(desc[0]);
+                    let bd = bodyMap.get(desc[0]);
+                    if (!bd) bd = createBody(desc);
+                    if (!bd) continue;
+                    bd._owner = owner;
+                    const x = Number(desc[1]) / 10, y = Number(desc[2]) / 10, angle = Number(desc[3]) / 1000;
+                    if (![x, y, angle].every(Number.isFinite)) continue;
+                    Body.setPosition(bd, { x, y }); Body.setAngle(bd, angle);
+                    bd._mpLast = [q(x, 10), q(y, 10), q(angle, 1000)];
+                }
+            }
+            if (d.done === true) {
+                const seen = bodySnapshotSeen || new Set();
+                for (const [id, bd] of bodyMap) {
+                    if (!id.startsWith('D' + LC() + '_') || seen.has(id)) continue;
+                    bodyMap.delete(id);
+                    if (m.holdingTarget === bd) { try { m.drop(); } catch (e) { } }
+                    dropBody(bd);
+                }
+                bodySnapshotSeen = null;
+            }
+        };
+        // Pickups are per-person: the host tells everyone what dropped and each player spawns their own copy.
+        H.pd = (p, d) => {
+            if (!isHostPeer(p) || S.isHost || S.loading || (d.lc | 0) !== LC() || !Array.isArray(d.l)) return;
+            for (const e of d.l.slice(0, 60)) {
+                const x = Number(e[1]), y = Number(e[2]), size = Number(e[3]);
+                if (typeof e[0] !== 'string' || !powerUps[e[0]] || !Number.isFinite(x) || !Number.isFinite(y)) continue;
+                const before = powerUp.length;
+                S.replayDrop = true;
+                try { powerUps.directSpawn(x, y, e[0], true, (Number.isFinite(size) && size > 0) ? size : undefined); }
+                catch (er) { } finally { S.replayDrop = false; }
+                const pu = powerUp.length > before ? powerUp[powerUp.length - 1] : null;
+                if (pu && !finiteBody(pu)) dropBody(pu);
+            }
+        };
+        // ---- experimental mode: everybody builds in their own menu; the shared run only starts once everyone is done ----
+        // The title screen's experiment button does more than build.reset(): it hides the title buttons, shows the grid and turns page scrolling on.
+        // A guest that skipped all that could not scroll the selection screen. Use the real thing.
+        function openBuildMenu() {
+            if (typeof openExperimentMenu === 'function') return openExperimentMenu();
+            return build.reset();
+        }
+        H.exp = (p, d) => {
+            if (!S.peers.has(p.id) || typeof d.st !== 'string') return;
+            if (d.st === 'sel' || d.st === 'ready') p.exp = d.st; else if (d.st === 'go') p.exp = null;
+            expTryRelease();
+        };
+        function expTryRelease() {
+            if (!S.expWait) return;
+            const blockers = openPeers().filter(p => p.exp === 'sel');   // still choosing (a player in the build menu sends no game state)
+            if (blockers.length && now() - S.expWaitAt < 120000) { ui.banner('Ready - waiting for ' + blockers.map(p => p.name).join(', ') + ' to finish their build...'); return; }
+            const go = S.expWait; S.expWait = null; S.expSel = false; S.expReady = false;
+            try { ui.banner(null); } catch (e) { }
+            sendEv({ t: 'exp', st: 'go' });
+            try { go(); } catch (e) { console.warn('[MP] experimental start failed', e); }
+        }
+        // ---- difficulty (black orb) is host-authoritative ----
+        function applyDifficulty(opts) {
+            try {
+                const dfc = powerUps.difficulty; const o = cleanDiff(opts); if (!o || !dfc) return;
+                const initial = { ...simulation.difficultyOptions };
+                const sel = dfc.normalize(o);
+                if (dfc.signature(initial) === dfc.signature(sel)) return;
+                S.diffApplying = true;
+                simulation.difficultyOptions = sel;
+                dfc.updateScale();
+                const tierChanged = initial.isMobTier23 !== sel.isMobTier23 || initial.isMobTier4 !== sel.isMobTier4;
+                dfc.setDamageAndDefense(tierChanged);
+                if (tierChanged && level.levelsCleared > 0 && typeof spawn !== 'undefined' && spawn.mobTypeSpawnOrder) {
+                    spawn.mobTypeSpawnIndex = level.levelsCleared + 1;
+                    spawn.pickList = [spawn.mobTypeSpawnOrder[Math.min(level.levelsCleared - 1, 13)], spawn.mobTypeSpawnOrder[Math.min(level.levelsCleared, 13)]];
+                }
+                level.updateDifficulty();
+                if (initial.isConstraint !== sel.isConstraint || initial.isStrongerConstraints !== sel.isStrongerConstraints) level.setConstraints();
+                lore.setTechGoal();
+                try { ui.banner('The host changed the difficulty.'); setTimeout(() => ui.banner(null), 3000); } catch (e) { }
+            } catch (e) { console.warn('[MP] applyDifficulty', e); }
+            finally { S.diffApplying = false; }
+        }
+        H.diff = (p, d) => { if (!isHostPeer(p) || S.isHost || S.solo || !S.inGame) return; applyDifficulty(d.o); };
+        H.name = (p, d) => { if (!S.peers.has(p.id)) return; const n = cleanName(d.name); if (n) { p.name = n; ui.refresh(); } };
+        function sendRoom(to) { sendEv({ t: 'room', pvp: S.pvp ? 1 : 0, tg: S.together ? 1 : 0, max: S.room.max, ask: S.room.ask ? 1 : 0 }, to); }
+        H.room = (p, d) => {
+            if (!S.peers.has(p.id) || S.isHost || !isHostPeer(p)) return;                    // only the host decides the room settings
+            S.pvp = d.pvp === 1; S.together = d.tg !== 0; S.room.ask = d.ask !== 0; S.room.max = Math.max(2, Math.min(12, d.max | 0 || 8));
+            ui.refresh();
+        };
+        H.po = (p, d) => {
+            if (!S.peers.has(p.id) || S.solo || S.loading || !S.inGame || (d.lc | 0) !== LC() || !Array.isArray(d.l) || p.dead) return;
+            const t = now(); if (!p._po || t - p._po.t > 1000) p._po = { t, n: 0 };
+            for (const e of d.l.slice(0, 30)) {
+                if (!Array.isArray(e) || ++p._po.n > 40) continue;
+                const x = Number(e[1]), y = Number(e[2]), size = Number(e[3]);
+                if (typeof e[0] !== 'string' || !powerUps[e[0]] || typeof powerUps[e[0]] !== 'object' || !Number.isFinite(x) || !Number.isFinite(y) || Math.abs(x) > 1e7 || Math.abs(y) > 1e7) continue;
+                const before = powerUp.length;
+                S.replayDrop = true;
+                try { powerUps.directSpawn(x, y, e[0], true, (Number.isFinite(size) && size > 0 && size < 500) ? size : undefined); }
+                catch (er) { } finally { S.replayDrop = false; }
+                const pu = powerUp.length > before ? powerUp[powerUp.length - 1] : null;
+                if (pu && !finiteBody(pu)) dropBody(pu);
+            }
+        };
+        H.s = (p, d) => {
+            if (!Number.isInteger(d.lc) || d.lc < 0) return;
+            // ---- ordering: drop duplicates / packets that arrive late on the unreliable channel; a new epoch (peer restarted) resets it
+            if (typeof d.ep === 'string' && d.ep !== p.ep) { p.ep = d.ep; p.lastSeq = -1; p.offMin = null; p.buf = []; }
+            if (Number.isInteger(d.sq)) { if (d.sq <= p.lastSeq) return; p.lastSeq = d.sq; }
+            const recv = now();
+            // ---- level: when a peer changes level, everything we hold from its previous level is void
+            if (p.lc !== d.lc) { p.buf = []; p.bl = null; p.blAt = 0; p.cur = null; p.lastRecvT = 0; p.vm = null; }
+            p.lc = d.lc; p.seenAt = recv;
+            // ---- clock offset: place each sample at the SENDER's time so bursts (tab was throttled, network jitter) don't play back fast
+            let st = recv;
+            if (Number.isFinite(d.ts)) {
+                const diff = recv - d.ts;
+                p.offMin = (p.offMin == null) ? diff : Math.min(p.offMin + 0.5, diff);      // follows the fastest path, slowly lets go of old minima
+                st = d.ts + p.offMin;
+                st = Math.min(st, recv);
+                if (p.lastRecvT && st <= p.lastRecvT) st = p.lastRecvT + 0.1;
+                p.lastRecvT = st;
+            }
+            const a = d.p;
+            if (Array.isArray(a) && a.length >= 16 && a.slice(0, 16).every(Number.isFinite)) {
+                const wasPaused = p.paused;
+                p.alive = !!a[5]; p.pvp = !!a[12]; p.mhp = Math.max(0.0001, Math.min(1e6, a[11] / 1000)); p.hp = Math.max(0, Math.min(p.mhp, a[10] / 1000)); p.og = !!a[13]; p.fm = a[7]; p.yOff = a[14]; p.paused = !!a[15]; p.dead = a[16] === 1; p.fa = a[17] === 1; p.imm = a[18] === 1; p.fr = Number.isFinite(a[19]) ? Math.max(0, Math.min(400, a[19])) : 0;
+                if (p.paused && !wasPaused) p.pausedAt = now();
+                p.buf.push({ t: st, x: a[0], y: a[1], vx: a[2] / 100, vy: a[3] / 100, a: a[4] / 1000 });
+                if (p.buf.length > 10) p.buf.shift();
+            }
+            // Bullet snapshots are visual-only. Reject malformed/oversized arrays before drawing.
+            p.blT = st; p.bl = (d.lc === LC() && Array.isArray(d.bl)) ? d.bl.slice(0, CFG.maxBullets * 8).map(v => Number.isFinite(v) ? v : 0) : null;
+            if (p.bl && p.bl.length % 8) p.bl.length -= p.bl.length % 8;
+            p.blAt = now();
+            p.vm = (d.lc === LC() && !S.loading) ? vmParse(d.vm, st) : null;
+            p.bp = (d.lc === LC() && Array.isArray(d.bp) && d.bp.length < 2500) ? d.bp.map(v => Number.isFinite(v) ? v : 0) : null;
+            const fromHost = isHostPeer(p);
+            if (d.cy != null && fromHost && !S.isHost && !p.paused) S.hostCy = { cy: Number(d.cy), t: now(), lc: p.lc, fi: d.fi };
+            if (p.lc !== LC() || S.loading) return;
+            if (Array.isArray(d.bk)) applyBlocks(p, d.bk.slice(0, 120));
+            if (Array.isArray(d.mo) && !S.isHost && fromHost) applyMobs(d.mo.slice(0, 300));
+            if (Array.isArray(d.mm) && !S.isHost && fromHost) applyMapMovers(d.mm.slice(0, 150));
+        };
+
+        // ------------------------------------------------------------------ seed / start / level lockstep
+        const seedEl = () => document.getElementById('seed');
+        function getSeed() { const e = seedEl(); return String((e && e.value.trim()) || (e && e.placeholder) || Math.initialSeed || ''); }
+        function setSeed(s) {
+            s = String(s == null ? '' : s);
+            const e = seedEl(); if (e) e.value = s;
+            Math.initialSeed = s;
+            if (typeof Math.hash === 'function') Math.seed = Math.abs(Math.hash(s));
+        }
+        function rollHostSeed() {
+            // Roll once on the session host; this value is broadcast and reused by every client.
+            try {
+                const a = new Uint32Array(1);
+                if (window.crypto && typeof window.crypto.getRandomValues === 'function') {
+                    window.crypto.getRandomValues(a); return String(a[0]);
+                }
+            } catch (e) { }
+            const stamp = Date.now().toString(36) + ':' + (performance.now() * 1000 | 0).toString(36) + ':' + S.id;
+            return String(Math.abs(typeof Math.hash === 'function' ? Math.hash(stamp) : stamp.split('').reduce((h, c) => (h * 31 + c.charCodeAt(0)) | 0, 0)));
+        }
+        // ------------------------------------------------------------------ elimination, spectating and revival
+        // A player who "dies" while others are still alive is ELIMINATED instead of ending the run for everybody:
+        // they stay connected, keep every weapon/tech/field/pickup (we never run n-gon's real death code, which would wipe the
+        // run), cannot be hurt or hurt anyone, and spectate a living teammate. When the host's next level begins, the host
+        // revives them (message 'rev'); each player is revived at most once per level. The run only really ends when the last
+        // living player dies, then everybody's normal n-gon death runs.
+        function livingOthers() {
+            const r = [];
+            for (const p of S.peers.values()) if (p.ev && p.ev.open && p.hello && p.alive && !p.dead) r.push(p);
+            return r;
+        }
+        function canEliminate() {
+            if (S.forceDeath || S.dead || !S.together || !S.inGame || S.solo || S.loading || !hasPeers()) return false;
+            if (typeof levelEditor !== 'undefined' && levelEditor && levelEditor.isActive) return false;
+            if (simulation.isTraining || !m.alive) return false;
+            if (tech.isImmortal || (tech.isEigenstate && m.eigen && m.eigen.deathCount === 0)) return false;   // n-gon's own second chances run first
+            return livingOthers().length > 0;
+        }
+        function wrapDeath() {
+            wrapFn(m, 'death', 'm.death', orig => function () {
+                if (S.dead && !S.forceDeath) return undefined;                    // already eliminated; stray damage must not end the run
+                let elim = false;
+                try { elim = canEliminate(); } catch (e) { elim = false; }
+                if (elim) { eliminate(); return undefined; }
+                if (S.dead) { S.dead = false; }
+                return orig.apply(this, arguments);
+            });
+            wrapFn(m, 'takeDamage', 'm.takeDamage', orig => function () { if (S.dead) return undefined; return orig.apply(this, arguments); });
+            // an eliminated player cannot advance the level by standing in the exit
+            // Level changes are decided by the HOST. A guest that reaches an exit only asks; the host changes level and everybody (the asking
+            // guest included) follows its 'lvl' message, so two players can never end up on different levels because of racing exits.
+            wrapFn(level, 'nextLevel', 'level.nextLevel', orig => function () {
+                if (S.dead && !S.applying && !S.remotePending && !S.forceDeath && !S.hostAction) return undefined;
+                if (!S.isHost && !S.applying && !S.remotePending && !S.forceLocalNext && S.together && S.inGame && !S.solo && !S.starting && hasPeers()
+                    && S.hostId && S.peers.has(S.hostId) && !simulation.isTraining) {
+                    requestNextLevel();
+                    return undefined;
+                }
+                S.forceLocalNext = false;
+                return orig.apply(this, arguments);
+            });
+        }
+        function requestNextLevel() {
+            const lc0 = LC();
+            if (S.lvlReqLc === lc0 && now() - S.lvlReqAt < 1500) return;          // the exit fires every frame while we stand in it
+            S.lvlReqLc = lc0; S.lvlReqAt = now();
+            sendEv({ t: 'lvlReq', lc: lc0 }, S.hostId);
+            // if the host never answers (it vanished without the connection closing) do not leave everybody stuck at the exit
+            setTimeout(() => {
+                if (LC() !== lc0 || S.isHost || !S.inGame || S.solo || S.loading || simulation.clearNow) return;
+                const hp = S.peers.get(S.hostId);
+                if (hp && now() - (hp.seenAt || 0) < 4000) { S.lvlReqLc = -1; return; }   // host is alive, just busy: the next exit frame asks again
+                S.forceLocalNext = true;
+                try { level.nextLevel(); } catch (e) { S.forceLocalNext = false; }
+            }, 7000);
+        }
+        function eliminate() {
+            S.dead = true; S.deadLc = LC(); S.deadAt = now(); S.revAuth = Math.min(S.revAuth, S.deadLc);
+            if (S.reviveTimer) { clearTimeout(S.reviveTimer); S.reviveTimer = null; }
+            try { m.drop(); } catch (e) { }
+            m.health = 0.001; try { m.displayHealth(); } catch (e) { }
+            m.immuneCycle = m.cycle + 1e9;
+            try { input.fire = false; input.field = false; } catch (e) { }
+            ui.banner('ELIMINATED — spectating. You come back at the start of the next level with everything you had.');
+            say('you were eliminated — you will be revived when the next level begins');
+            sendEv({ t: 'dead', lc: LC() });
+        }
+        function resetDead() {
+            if (S.reviveTimer) { clearTimeout(S.reviveTimer); S.reviveTimer = null; }
+            S.dead = false; S.deadLc = -1; S.revivedLc = -1; S.revAuth = -1; S.forceDeath = false;
+            try { ui.banner(null); } catch (e) { }
+        }
+        function revive() {
+            if (!S.dead) return;
+            S.dead = false; S.revivedLc = LC();
+            if (S.reviveTimer) { clearTimeout(S.reviveTimer); S.reviveTimer = null; }
+            // nothing else is touched: weapons, techs, field, field upgrades, pickups and research stay as they were
+            try { m.health = m.maxHealth; if (typeof m.maxEnergy === 'number') m.energy = Math.max(m.energy || 0, m.maxEnergy); m.displayHealth(); } catch (e) { }
+            m.immuneCycle = m.cycle + 180;                                      // 2.5 s of grace
+            // valid spawn: use the level's spawn point if the current position is missing, not finite or inside the map
+            try {
+                const bad = !m.pos || !Number.isFinite(m.pos.x) || !Number.isFinite(m.pos.y) || (typeof m.isInsideMap === 'function' && m.isInsideMap());
+                if (bad && m.spawnPos && Number.isFinite(m.spawnPos.x) && Number.isFinite(m.spawnPos.y)) {
+                    Matter.Body.setPosition(player, { x: m.spawnPos.x, y: m.spawnPos.y });
+                    m.pos.x = m.spawnPos.x; m.pos.y = m.spawnPos.y;
+                }
+                Matter.Body.setVelocity(player, { x: 0, y: 0 });
+            } catch (e) { }
+            ui.banner(null);
+            say('you were revived');
+            sendEv({ t: 'revived', lc: LC() });
+        }
+        function tryRevive() {
+            if (!S.dead || S.loading || !S.inGame) return;
+            if (S.revivedLc === LC()) return;                                    // never twice for the same level
+            if (LC() > S.deadLc && S.revAuth >= LC()) revive();
+        }
+        // runs after every level is built
+        function reviveCheck() {
+            if (S.solo || !S.together) { if (S.dead) resetDead(); return; }
+            const lc = LC();
+            if (S.isHost) {
+                // authority: the host decides who comes back (itself and every peer that reported being eliminated on an older level)
+                const ids = [];
+                if (S.dead && lc > S.deadLc) { S.revAuth = Math.max(S.revAuth, lc); ids.push(S.id); }
+                for (const p of S.peers.values()) if (p.dead) ids.push(p.id);
+                tryRevive();
+                if (ids.length && hasPeers()) sendEv({ t: 'rev', lc, ids });
+                for (const p of S.peers.values()) if (p.dead && p.ev && p.ev.open) p.dead = false;   // optimistic; the peer's next state packet confirms
+            } else if (S.dead && lc > S.deadLc) {
+                tryRevive();
+                // fallback when the host's message never arrives (host left, packet lost): revive locally after a short wait
+                if (S.dead && !S.reviveTimer) {
+                    const lc0 = lc;
+                    S.reviveTimer = setTimeout(() => {
+                        S.reviveTimer = null;
+                        if (S.dead && LC() === lc0 && S.revivedLc !== lc0) { S.revAuth = Math.max(S.revAuth, lc0); revive(); }
+                    }, 3000);
+                }
+            }
+        }
+        // each physics step while eliminated: no shooting, follow a living teammate, stay unhurt
+        Matter.Events.on(engine, 'beforeUpdate', guard('spectate', () => {
+            if (!S.dead) {
+                if (S.specMask != null) { try { player.collisionFilter.mask = S.specMask; } catch (e) { } S.specMask = null; }
+                return;
+            }
+            try { input.fire = false; input.field = false; } catch (e) { }
+            try { if (S.specMask == null) S.specMask = player.collisionFilter.mask; player.collisionFilter.mask = 0; } catch (e) { }   // a spectator does not collide with anything
+            m.immuneCycle = m.cycle + 1e9;
+            if (m.health > 0.01) m.health = 0.001;
+            const live = livingOthers().filter(p => p.cur && Number.isFinite(p.cur.x)).sort((a, b) => a.id < b.id ? -1 : 1)[0];
+            if (live) {
+                const x = live.cur.x, y = live.cur.y;
+                try { simulation.mouse.x = canvas.width2; simulation.mouse.y = canvas.height2; } catch (e) { }   // no look-ahead offset: the camera sits exactly on the spectated player
+                Matter.Body.setPosition(player, { x, y }); Matter.Body.setVelocity(player, { x: 0, y: 0 });
+                if (m.pos) { m.pos.x = x; m.pos.y = y; }
+            }
+        }));
+        // everyone left alive is gone (they disconnected or died): the run ends for real
+        function checkAllDown() {
+            if (!S.dead || S.forceDeath || now() - S.deadAt < 1500) return;
+            if (livingOthers().length === 0) { S.forceDeath = true; try { m.death(); } finally { S.forceDeath = false; S.dead = false; try { ui.banner(null); } catch (e) { } } }
+        }
+        // ---- level order: the host's list is authoritative (level pools / local levels may differ per player) ----
+        function lvInfo() { return { lv: Array.isArray(level.levels) ? level.levels.slice() : null, fl: !!simulation.isHorizontalFlipped, df: cleanDiff(simulation.difficultyOptions) }; }
+        function cleanDiff(o) {
+            if (!o || typeof o !== 'object') return null;
+            const r = {}; let n = 0;
+            for (const k of Object.keys(o)) { const v = o[k]; if (++n > 64) break; if (typeof v === 'boolean' || (typeof v === 'number' && Number.isFinite(v)) || (typeof v === 'string' && v.length < 40)) r[String(k).slice(0, 40)] = v; }
+            return r;
+        }
+        function mapsAvailable(name) {
+            try { return [level.maps, level.localMaps, typeof moreLevels === 'undefined' ? null : moreLevels].some(m_ => m_ && Object.prototype.hasOwnProperty.call(m_, name) && typeof m_[name] === 'function'); }
+            catch (e) { return true; }
+        }
+        // make sure every level of the host's route exists here (community levels load lazily); resolves to false if one is missing
+        function prepareRoute(lv) {
+            if (!Array.isArray(lv)) return Promise.resolve(true);
+            const missing = () => lv.filter(n => !mapsAvailable(n));
+            if (!missing().length) return Promise.resolve(true);
+            const go = (typeof level.loadMoreLevels === 'function') ? Promise.resolve().then(() => level.loadMoreLevels()).catch(() => { }) : Promise.resolve();
+            return go.then(() => {
+                const m_ = missing();
+                if (m_.length) { say('the host\'s level list needs maps you do not have: ' + esc(m_.join(', '))); return false; }
+                return true;
+            });
+        }
+        function beginRun(seed, lv, fl, df, exp) {      // join a run started by someone else
+            S.forceLv = Array.isArray(lv) ? lv.map(String).slice(0, 64) : null;
+            S.forceFlip = typeof fl === 'boolean' ? fl : null;
+            S.forceDf = cleanDiff(df);
+            return prepareRoute(S.forceLv).then(ok => {
+                if (!ok) { S.forceLv = null; S.forceFlip = null; }
+                if (S.inGame || S.starting) return;
+                startLocalGame(seed, exp);
+            });
+        }
+        // level.populateLevels uses plain Math.random for the late "factory/reservoir/interferometer" pick and reads the PER-PLAYER level pool:
+        // make the random part deterministic and let the host's list win
+        function wrapPopulateLevels() {
+            wrapFn(level, 'populateLevels', 'level.populateLevels', orig => function () {
+                if (!hasPeers() || !S.together || S.solo || simulation.isTraining) return orig.apply(this, arguments);
+                const realRandom = Math.random, seeded = Math.seededRandom;
+                if (typeof seeded === 'function') Math.random = function () { return seeded(); };
+                try { orig.apply(this, arguments); }
+                finally { Math.random = realRandom; }
+                if (S.forceLv && S.forceLv.length) { level.levels = S.forceLv.slice(); }
+                if (S.forceFlip !== null) simulation.isHorizontalFlipped = S.forceFlip;
+                S.forceLv = null; S.forceFlip = null;
+                return undefined;
+            });
+        }
+        function startLocalGame(seed, exp) {
+            if (seed != null) {
+                S.runSeed = String(seed);
+                setSeed(S.runSeed);
+            }
+            S.applying = true;
+            try {
+                if (exp && typeof build !== 'undefined' && typeof build.reset === 'function') { openBuildMenu(); }   // experimental mode: opens this player's own build menu (it starts the shared run itself)
+                else simulation.startGame();
+            }
+            catch (e) { console.warn('[MP] could not start game', e); }
+            finally { S.applying = false; }
+        }
+        // n-gon changes level in two phases: level.nextLevel() bumps the counters and sets simulation.clearNow;
+        // on the NEXT frame the game runs simulation.clearMap() + level.start(). The map is built in level.start from a seed
+        // that depends only on (run seed, level number), so every player gets the same map even if they are paused or busy.
+        function syncToLevel(target) {
+            if (target > S.catchTarget) S.catchTarget = target;
+            if (S.catchRunning) return;
+            S.catchRunning = true;
+            let guardN = 0;
+            const step = () => {
+                if (!S.inGame || LC() >= S.catchTarget || ++guardN > 2000) { S.catchRunning = false; return; }
+                if (simulation.clearNow || S.loading) { setTimeout(step, 40); return; }   // previous level still being built (or this player is paused)
+                S.remotePending = true;                                                   // consumed by the next clearMap
+                S.applying = true;
+                const wasChoosing = !!simulation.isChoosing;
+                try { level.nextLevel(); } catch (e) { console.warn('[MP] could not advance level', e); S.catchRunning = false; S.remotePending = false; return; } finally { S.applying = false; }
+                // n-gon pauses on an info screen when entering "reactor"/"final". The player who reached the exit already saw it;
+                // following players must not be stalled for seconds on it. We are still inside the same task, so no frame ran
+                // between the pause and this undo and the game loop's frame chain is intact (do NOT request another frame).
+                if (!wasChoosing && simulation.isChoosing && simulation.paused && simulation.clearNow) {
+                    simulation.isChoosing = false; simulation.paused = false;
+                    try { const cg = document.getElementById('choose-grid'); cg.style.visibility = 'hidden'; cg.style.opacity = '0'; } catch (e) { }
+                    try { build.unPauseGrid(); } catch (e) { }
+                    try { document.body.style.cursor = 'none'; } catch (e) { }
+                }
+                if (!simulation.clearNow) S.remotePending = false;
+                setTimeout(step, 60);
+            };
+            step();
+        }
+        function runCatchup() { if (S.inGame && !S.loading && S.catchTarget > LC() && !S.catchRunning) syncToLevel(S.catchTarget); }
+
+        const onStartPre = guard('startGame.pre', () => {
+            S.starting = true; destroyGhosts(); resetSync(); resetDead();
+            if (!S.applying) S.catchTarget = 0;
+            S.catchRunning = false;
+            S.loading = true; S.loadingSince = now(); S.inGame = false;
+        });
+        wrapFn(simulation, 'startGame', 'simulation.startGame', orig => function () {
+            // Training (startGame(false, true)) and build runs (startGame(true)) are private solo runs: nothing is synced.
+            const isBuildRun = arguments[0] === true && !arguments[1];
+            if ((arguments[1] === true || (arguments[0] === true && !hasPeers())) && !S.applying) {   // training (and a build run with nobody connected) stays private; a build run with peers is shared
+                S.solo = true; refreshRole();
+                S.runSeed = getSeed(); setSeed(S.runSeed);
+                onStartPre();
+                let r;
+                try { r = orig.apply(this, arguments); }
+                catch (e) { S.starting = false; throw e; }
+                const fin = () => { S.inGame = true; S.loadingSince = now(); S.starting = false; };
+                if (r && typeof r.then === 'function') return r.then(v => { fin(); return v; }, e => { S.starting = false; throw e; });
+                fin(); return r;
+            }
+            if (S.solo) { S.solo = false; refreshRole(); }
+            const loadingSave = !!S.savePending;             // a checkpoint is being loaded: keep ITS seed, then resync everyone
+            if (loadingSave) S.saveStarted = true;
+            // A guest asks the lobby leader to start; it never starts a divergent local run.
+            if (!S.applying && hasPeers() && !S.isHost && !loadingSave) {
+                sendEv({ t: 'startReq', exp: isBuildRun ? 1 : 0 }, S.hostId);
+                return;
+            }
+            let announce = false;
+            if (!S.applying) {
+                if (loadingSave) S.runSeed = String(Math.initialSeed != null ? Math.initialSeed : getSeed());
+                else {
+                    S.runSeed = hasPeers() ? rollHostSeed() : getSeed();
+                    setSeed(S.runSeed);
+                    announce = hasPeers();
+                }
+            } else if (S.runSeed == null) {
+                S.runSeed = getSeed();
+            }
+            // these two persist between runs and are NOT reset by n-gon: a player who already played a run would otherwise get
+            // a different constraint order than a fresh one
+            if (!loadingSave && !simulation.isTraining) { canonConstraints(); }
+            onStartPre();
+            let restoreDf = null;
+            if (S.applying && S.forceDf && !simulation.isTraining && typeof localSettings === 'object' && localSettings) {
+                const saved = localSettings.difficultyOptions;
+                localSettings.difficultyOptions = { ...S.forceDf };                      // startGame reads the player's OWN saved difficulty
+                restoreDf = () => { localSettings.difficultyOptions = saved; };
+            }
+            S.forceDf = null;
+            let r;
+            try { r = orig.apply(this, arguments); }
+            catch (e) { if (restoreDf) restoreDf(); S.starting = false; S.loading = false; throw e; }
+            if (restoreDf && !(r && typeof r.then === 'function')) restoreDf();
+            const fin = () => {
+                if (restoreDf) restoreDf();
+                S.inGame = true; S.loadingSince = now(); S.starting = false;
+                if (S.runSeed == null) S.runSeed = String(getSeed());
+                if (!loadingSave) setSeed(S.runSeed);
+                // tell everyone only NOW: populateLevels has run, so the host's level order and flip are known
+                if (announce && hasPeers()) sendEv({ t: 'start', seed: S.runSeed, exp: isBuildRun ? 1 : 0, ...lvInfo() });
+            };
+            // startGame is async (community maps / training load extra levels first): everything after that await runs later
+            if (r && typeof r.then === 'function') return r.then(v => { fin(); return v; }, e => { S.starting = false; S.loading = false; throw e; });
+            fin();
+            return r;
+        });
+        function canonConstraints() {
+            try {
+                if (Array.isArray(level.constraint)) level.constraint.sort((a, b) => String(a.description).localeCompare(String(b.description)));
+                level.constraintIndex = 0;
+            } catch (e) { }
+            // spawn.setMobTypeSpawnOrder() seededShuffle()s spawn.tier[1..4] and spawn.bossTier[1..4] IN PLACE, starting from whatever order the
+            // previous run left behind. A player who already played a run therefore got different mob types/bosses than a fresh player
+            // even with the same seed. Start every shared run from the same (sorted) order, like n-gon's own level editor does.
+            try {
+                for (const key of ['tier', 'bossTier']) {
+                    const lists = spawn[key]; if (!Array.isArray(lists)) continue;
+                    for (let i = 1; i < lists.length; i++) if (Array.isArray(lists[i])) lists[i].sort();
+                }
+                if (Array.isArray(spawn.bossTierIndex)) spawn.bossTierIndex = spawn.bossTierIndex.map(() => 0);
+                spawn.mobTypeSpawnIndex = 0;
+            } catch (e) { }
+        }
+        const onClearPre = guard('clearMap.pre', () => {
+            destroyGhosts(); resetSync(); S.loading = true; S.loadingSince = now();
+            for (const q_ of S.peers.values()) { q_.buf = []; q_.bl = null; q_.blAt = 0; q_.cur = null; q_.lastRecvT = 0; }
+            if (S.starting) { S.starting = false; }
+            else if (S.remotePending) { S.remotePending = false; }                  // level change requested by another player
+            else if (S.inGame && S.together && !S.solo && hasPeers()) {              // we changed level: tell everybody
+                sendEv({ t: 'lvl', lc: LC() });
+            }
+        });
+        wrapFn(simulation, 'clearMap', 'simulation.clearMap', orig => function () { onClearPre(); return orig.apply(this, arguments); });
+        const onLevelStart = guard('level.start.post', () => { S.levelStartCycle = simulation.cycle; S.inGame = true; S.starting = false; afterLevelLoaded(); });
+        // Build every level from the SAME random numbers on every client:
+        //  1. the seed is derived from (run seed, level number), independent of anything else that happened in the run
+        //  2. plain Math.random (used by some map generators for sizes, counts and drops) is swapped for the seeded generator
+        const hooked = wrapFn(level, 'start', 'level.start', orig => function () {
+            S.buildingLevel = true;
+            S.buttons = Object.create(null); S.buttonSeq = 0; S.buttonSent.clear(); S.remoteButtons.clear();
+            const realRandom = Math.random;
+            const realSeed = Math.seed;
+            const seeded = Math.seededRandom;
+            if (S.savePending && S.saveStarted && Math.initialSeed != null) S.runSeed = String(Math.initialSeed);   // checkpoint: the SAVE's seed
+            const runSeed = String(S.runSeed != null ? S.runSeed : getSeed());
+            const swap = hasPeers() && S.together && !S.solo && typeof seeded === 'function' && typeof Math.hash === 'function';
+            if (swap) {
+                // Every player starts the level's random stream from the same run-seed/level pair.
+                Math.seed = Math.abs(Math.hash(runSeed + '|LEVEL|' + LC()));
+                Math.random = function () { return seeded(); };
+            }
+            // newer n-gon builds can finish level.start() asynchronously (local levels with code), so wait for it
+            let finished = false;
+            const finish = () => {
+                if (finished) return; finished = true;
+                Math.random = realRandom;
+                if (swap) Math.seed = realSeed;
+                S.buildingLevel = false;
+                onLevelStart();
+            };
+            let r;
+            try { r = orig.apply(this, arguments); }
+            catch (e) { finish(); throw e; }
+            if (r && typeof r.then === 'function') return r.then(v => { finish(); return v; }, e => { finish(); throw e; });
+            finish();
+            return r;
+        });
+        if (!hooked) console.warn('[MP] level changes will be detected by polling instead');
+
+        function sendButtonSnapshot(to) {
+            if (!S.isHost || !S.inGame || S.solo || !hasPeers()) return;
+            const list = [];
+            for (const i of Object.keys(S.buttons)) {
+                const b = S.buttons[i]; if (b) list.push([i, !!b.isUp]);
+            }
+            sendEv({ t: 'btns', lc: LC(), cy: simulation.cycle, l: list }, to);
+        }
+        function publishButtonState(button) {
+            if (!S.isHost || S.solo || !hasPeers() || !button || typeof button._mpButtonId !== 'string') return;
+            const i = button._mpButtonId, up = !!button.isUp;
+            if (S.buttonSent.get(i) === up) return;
+            S.buttonSent.set(i, up);
+            sendEv({ t: 'btn', lc: LC(), cy: simulation.cycle, i, up });
+        }
+        function withAllPlayersInButtonQuery(fn) {
+            if (!S.isHost || !ghosts.size) return fn();
+            const region = Matter.Query.region;
+            Matter.Query.region = function (bodies, bounds) {
+                if (Array.isArray(bodies) && bodies.length === 1 && bodies[0] === player) {
+                    const all = [player];
+                    // paused players are standing still and can't press buttons on purpose
+                    const hw = (player.bounds.max.x - player.bounds.min.x) / 2, hh = (player.bounds.max.y - player.bounds.min.y) / 2;   // a remote player is as big as a real one (the ghost circle is smaller and would miss buttons)
+                    for (const g of ghosts.values()) {
+                        const pp = S.peers.get(g.gid);
+                        if (!(g && g.alive && g.position && pp && !pp.dead && !peerPaused(pp))) continue;
+                        const cy = g.position.y + (Number.isFinite(pp.yOff) ? pp.yOff : 49);                // the ghost sits at m.pos; the real body centre is yOff lower
+                        all.push({ bounds: { min: { x: g.position.x - hw, y: cy - hh }, max: { x: g.position.x + hw, y: cy + hh } }, position: { x: g.position.x, y: cy } });
+                    }
+                    return region.call(this, all, bounds);
+                }
+                return region.apply(this, arguments);
+            };
+            try { return fn(); } finally { Matter.Query.region = region; }
+        }
+        function wrapButtons() {
+            wrapFn(level, 'button', 'level.button', orig => function () {
+                const button = orig.apply(this, arguments);
+                // Identified by position, not creation order: levels that rebuild themselves in place (gravitron's flip) create buttons at times that
+                // differ between clients, which used to shift every later id.
+                const id = (button && button.min && Number.isFinite(button.min.x)) ? Math.round(button.min.x) + ':' + Math.round(button.min.y) : 'n' + (S.buttonSeq++);
+                button._mpButtonId = id;
+                if (S.buttons[id] && S.buttons[id] !== button) { S.remoteButtons.delete(id); S.buttonSent.delete(id); }   // the level rebuilt this button: forget the old object's state
+                S.buttons[id] = button;
+                for (const method of ['query', 'queryRemove', 'queryPlayer']) {
+                    const original = button[method];
+                    if (typeof original !== 'function' || original._mpButtonWrapped) continue;
+                    const wrapped = function () {
+                        if (S.isHost) {
+                            const result = withAllPlayersInButtonQuery(() => original.apply(this, arguments));
+                            publishButtonState(this);
+                            return result;
+                        }
+                        const state = S.remoteButtons.get(id);
+                        if (this._mpPending) {
+                            this._mpPending = false;
+                            if (now() - (this._mpPendingAt || 0) < 700) {                    // a press that is still fresh: the level reacts to it exactly once
+                                for (const k in S.buttons) if (S.buttons[k]) S.buttons[k]._mpPending = false;      // the other buttons of the same press (floor + ceiling pair) are the same press
+                                this.isUp = false; return undefined;
+                            }
+                        }
+                        if (state) this.isUp = state.up;
+                        return undefined;
+                    };
+                    wrapped._mpButtonWrapped = true;
+                    button[method] = wrapped;
+                }
+                return button;
+            });
+        }
+        function frameRandom(key) {
+            const text = String(S.runSeed || getSeed()) + '|' + LC() + '|' + simulation.cycle + '|' + key;
+            let x = 2166136261;
+            for (let i = 0; i < text.length; i++) { x ^= text.charCodeAt(i); x = Math.imul(x, 16777619); }
+            return function () {
+                x ^= x << 13; x ^= x >>> 17; x ^= x << 5;
+                return (x >>> 0) / 4294967296;
+            };
+        }
+        // level.custom / level.customTopLayer are REASSIGNED by every level, so wrap them through an accessor
+        function wrapLevelFrameRandom() {
+            for (const key of ['custom', 'customTopLayer']) {
+                try {
+                    const wrap = f => {
+                        if (typeof f !== 'function' || f._mpw) return f;
+                        const w = function () {
+                            if (!hasPeers() || !S.together || !S.inGame || S.solo || S.runSeed == null) return f.apply(this, arguments);
+                            const realRandom = Math.random;
+                            Math.random = frameRandom(key);
+                            try { return f.apply(this, arguments); }
+                            finally { Math.random = realRandom; }
+                        };
+                        w._mpw = true; return w;
+                    };
+                    let val = wrap(level[key]);
+                    Object.defineProperty(level, key, { configurable: true, enumerable: true, get() { return val; }, set(v) { val = wrap(v); } });
+                } catch (e) { console.warn('[MP] could not wrap level.' + key, e); }
+            }
+        }
+        // ---- generic sync of moving / destroyed level geometry (works whatever level-elements API builds it) ----
+        function assignMapIds() {
+            S.mapIds = new Map(); S.mapSent = new Map(); S.mapBase = new Map();
+            if (typeof map === 'undefined' || !Array.isArray(map)) return;
+            let i = 0;
+            for (const bd of map) {
+                if (!bd || !bd.position) continue;
+                if (bd._mid === undefined) bd._mid = 'M' + LC() + '_' + i;
+                i++;
+                S.mapIds.set(bd._mid, bd);
+                S.mapBase.set(bd._mid, [q(bd.position.x, 10), q(bd.position.y, 10), q(bd.angle, 1000)]);
+                S.mapSent.set(bd._mid, S.mapBase.get(bd._mid));
+            }
+        }
+        function sendMapSnapshot(to) {
+            if (!S.isHost || S.solo || !S.mapIds || !S.mapIds.size) return;
+            const entries = [];
+            for (const [id, bd] of S.mapIds) {
+                if (!bd || !bd.position || !finiteBody(bd)) continue;
+                entries.push([id, q(bd.position.x, 10), q(bd.position.y, 10), q(bd.angle, 1000)]);
+            }
+            // Keep individual reliable event packets small enough for PeerJS data channels.
+            for (let i = 0; i < entries.length; i += 100) {
+                sendEv({ t: 'maps', lc: LC(), l: entries.slice(i, i + 100) }, to);
+            }
+        }
+        function sendBodySnapshot(to) {
+            if (!S.isHost || S.solo) return;
+            const entries = [];
+            for (const [id, bd] of bodyMap) {
+                if (!bd || bd._gone || !id.startsWith('D' + LC() + '_') || !finiteBody(bd) || !Array.isArray(bd.vertices)) continue;
+                try { entries.push([descBody(bd), typeof bd._owner === 'string' ? bd._owner : null]); }
+                catch (e) { /* skip bodies that cannot be serialized safely */ }
+            }
+            sendEv({ t: 'bfull', lc: LC(), begin: true }, to);
+            // Full world-object state is chunked so large builds do not exceed a data-channel packet limit.
+            for (let i = 0; i < entries.length; i += 40) {
+                sendEv({ t: 'bfull', lc: LC(), l: entries.slice(i, i + 40) }, to);
+            }
+            sendEv({ t: 'bfull', lc: LC(), done: true }, to);
+        }
+        function scanMapMovers() {
+            if (!S.isHost || !S.mapIds || S.solo) return null;
+            const out = [], periodic = S.tickN % 40 === 0;
+            if (S.tickN % 10 === 0) {                                                   // destroyed map bodies
+                const present = new Set(map), gone = [];
+                for (const [id, bd] of S.mapIds) if (!present.has(bd)) gone.push(id);
+                if (gone.length) { for (const id of gone) S.mapIds.delete(id); sendEv({ t: 'mg', lc: LC(), l: gone }); }
+            }
+            for (const [id, bd] of S.mapIds) {
+                if (!bd.position) continue;
+                const x = q(bd.position.x, 10), y = q(bd.position.y, 10), a = q(bd.angle, 1000), l = S.mapSent.get(id), base = S.mapBase.get(id);
+                if (l && (Math.abs(l[0] - x) > 1 || Math.abs(l[1] - y) > 1 || Math.abs(l[2] - a) > 2)) { out.push([id, x, y, a]); S.mapSent.set(id, [x, y, a]); }
+                else if (periodic && base && (Math.abs(base[0] - x) > 1 || Math.abs(base[1] - y) > 1 || Math.abs(base[2] - a) > 2)) out.push([id, x, y, a]);   // re-send moved bodies now and then (late joiners, lost packets)
+                if (out.length >= 150) break;
+            }
+            return out;
+        }
+        function applyMapMovers(list) {
+            if (!S.mapIds || !Array.isArray(list)) return;
+            for (const e of list.slice(0, 200)) {
+                if (!Array.isArray(e) || e.length < 3 || typeof e[0] !== 'string' || !Number.isFinite(e[1]) || !Number.isFinite(e[2])) continue;
+                const bd = S.mapIds.get(e[0]); if (!bd) continue;
+                Body.setPosition(bd, { x: e[1] / 10, y: e[2] / 10 });
+                if (Number.isFinite(e[3])) Body.setAngle(bd, e[3] / 1000);
+            }
+        }
+        // ---- features of newer n-gon builds: checkpoints, level editor ----
+        function watchSaveLoad() {
+            if (S.saveWatching) return;
+            S.saveWatching = true; S.saveStarted = false;
+            const t0 = now();
+            const iv = setInterval(guard('saveWatch', () => {
+                if (now() - t0 > 20000) { clearInterval(iv); S.saveWatching = false; S.savePending = false; return; }
+                if (S.saveStarted && S.inGame && !S.loading && !simulation.clearNow) {
+                    clearInterval(iv); S.saveWatching = false; S.savePending = false; S.saveStarted = false;
+                    S.runSeed = String(Math.initialSeed != null ? Math.initialSeed : getSeed());
+                    if (hasPeers() && !S.solo) sendEv({ t: 'resync', seed: S.runSeed, lc: LC(), ...lvInfo() });
+                }
+            }), 250);
+        }
+        function wrapNewFeatures() {
+            if (typeof levelEditor !== 'undefined' && levelEditor) {
+                wrapFn(levelEditor, 'open', 'levelEditor.open', orig => function () {
+                    if (hasPeers()) { say('the level editor is disabled while connected to other players (local levels differ per player)'); return undefined; }
+                    return orig.apply(this, arguments);
+                });
+            } else HOOKS['levelEditor'] = false;
+            // saveGame.load is the single entry for continueRun / import / rewind
+            if (typeof saveGame !== 'undefined' && saveGame && typeof saveGame.load === 'function') {
+                wrapFn(saveGame, 'load', 'saveGame.load', orig => function () {
+                    if (hasPeers() && !S.isHost) { say('only the host can load a checkpoint while connected'); return undefined; }
+                    S.savePending = true; watchSaveLoad();
+                    const done = () => { if (!S.saveStarted) { S.savePending = false; } };   // load bailed out before starting a game
+                    let r;
+                    try { r = orig.apply(this, arguments); } catch (e) { done(); throw e; }
+                    if (r && typeof r.then === 'function') return r.then(v => { done(); return v; }, e => { done(); throw e; });
+                    done(); return r;
+                });
+            } else HOOKS['saveGame'] = false;
+        }
+        function idHash(ids) {
+            const a = ids.slice().sort(); let h = 2166136261 >>> 0;
+            for (let i = 0; i < a.length; i++) { const t = a[i] + '|'; for (let j = 0; j < t.length; j++) { h ^= t.charCodeAt(j); h = Math.imul(h, 16777619) >>> 0; } }
+            return h;
+        }
+        function sendMobRoster(to) {
+            if (!S.isHost || !S.inGame || S.solo) return;
+            const list = realMobs().filter(mo => mo.alive && mo._nid != null);
+            const ids = list.map(mo => mo._nid);
+            // a roster of hundreds of ids would be ~10 KB: send the count and a hash of the sorted ids instead (ids themselves only while few)
+            sendEv({ t: 'mc', lc: LC(), n: ids.length, h: idHash(ids), ...(ids.length <= 30 ? { ids } : {}), ol: String(level.onLevel) }, to);
+        }
+        function resetSync() {
+            mobMap.clear(); bodyMap.clear(); puMap.clear(); bodySnapshotSeen = null;
+            spawnQ = []; deathQ = []; opsQ = []; dropQ = []; ownPuQ = []; fxQ = []; dmgOut.clear(); pvpOut.clear();
+            S.aliveIds = null; S.mc = null; S.ctr = 0; S.hostCy = null;
+            S.buttons = Object.create(null); S.buttonSeq = 0; S.buttonSent.clear(); S.remoteButtons.clear();
+            S.mapIds = null; S.mapSent = new Map(); S.mapBase = new Map();
+        }
+        function afterLevelLoaded() {
+            try { afterLevelLoaded2(); } finally { S.loading = false; }
+        }
+        function afterLevelLoaded2() {
+            const lc = LC(); let i = 0;
+            for (const mo of mob) { if (!mo || mo.isGhost) continue; if (mo._nid === undefined) mo._nid = 'L' + lc + '_' + (i++); mobMap.set(mo._nid, mo); }
+            i = 0;
+            for (const bd of body) { if (!bd) continue; if (bd._nid === undefined) { bd._nid = 'L' + lc + '_' + (i++); bd._owner = null; } bodyMap.set(bd._nid, bd); }
+            i = 0;
+            for (const pu of powerUp) { if (!pu) continue; if (pu._pid === undefined) pu._pid = 'L' + lc + '_' + (i++); puMap.set(pu._pid, pu); }
+            assignMapIds();
+            if (!S.isHost) for (const mo of mob) puppetize(mo);
+            S.aliveIds = new Set(); for (const mo of mob) if (mo && !mo.isGhost && mo._nid !== undefined && mo.alive) S.aliveIds.add(mo._nid);
+            S.loading = false; S.builtAt = now();
+            try { reviveCheck(); } catch (e) { console.warn('[MP] revive', e); }
+            if (S.isHost && hasPeers()) {
+                sendMobRoster();
+                sendButtonSnapshot();
+            } else if (!S.isHost && hasPeers() && S.hostId) {
+                // Request the full authoritative state only after this client has
+                // generated its level bodies, map IDs, and button IDs.
+                sendEv({ t: 'mreq', lc: LC() }, S.hostId);
+            }
+        }
+        // A guest never creates enemies by itself after the level is built: anything without a host id is a leftover (a shield rolled with
+        // local randomness, a direct mobs.spawn from level code...) and would be a duplicate of what the host sends.
+        function sweepStrays() {
+            if (S.isHost || S.solo || S.loading || S.catchRunning || !S.inGame || S.replay || S.buildingLevel) return;
+            if (now() - (S.builtAt || 0) < 1500) return;
+            for (const mo of realMobs()) if (mo.alive && mo._nid == null && !mo._keep) killSilently(mo);
+        }
+        function checkMc() {
+            if (S.isHost || !S.mc || S.loading || S.catchRunning || !S.inGame) return;
+            if (S.mc.lc !== LC()) return;
+            const local = realMobs().filter(mo => mo.alive && mo._nid != null).map(mo => mo._nid);
+            const wanted = Array.isArray(S.mc.ids) ? S.mc.ids : null;
+            const mismatch = wanted
+                ? (local.length !== wanted.length || wanted.some(id => !local.includes(id)))
+                : (local.length !== S.mc.n || (Number.isFinite(S.mc.h) && idHash(local) !== S.mc.h));
+            S.mc = null;
+            if (mismatch) sendEv({ t: 'mreq', lc: LC() }, S.hostId);
+        }
+        let lastKey = null;
+        function levelWatch() {
+            const k = LC() + ':' + level.onLevel;
+            if (S.loading && !simulation.clearNow && !S.paused && now() - (S.loadingSince || 0) > 2000) afterLevelLoaded();     // never stay "loading" forever
+            else if (!hooked && lastKey !== null && k !== lastKey && !S.loading && S.inGame && !simulation.clearNow) { destroyGhosts(); resetSync(); afterLevelLoaded(); }
+            lastKey = k;
+        }
+
+        // ------------------------------------------------------------------ mobs
+        const realMobs = () => mob.filter(mo => mo && !mo.isGhost);
+        function removeBodyAndConstraints(t) {
+            if (!t) return;
+            try {
+                const att = Composite.allConstraints(engine.world).filter(c => c.bodyA === t || c.bodyB === t);
+                for (const c of att) Composite.remove(engine.world, c);
+                Composite.remove(engine.world, t);
+            } catch (e) { }
+        }
+        function killSilently(mo) {
+            mo.alive = false; mo.isDropPowerUp = false; removeBodyAndConstraints(mo);
+            const i = mob.indexOf(mo); if (i !== -1) mob.splice(i, 1);
+        }
+        function safeArgs(args) {
+            for (const v of args) if (!(v == null || ['number', 'string', 'boolean'].includes(typeof v))) return null;
+            return args.slice();
+        }
+        function wrapSpawns() {
+            for (const key of Object.keys(spawn)) {
+                let fn; try { fn = spawn[key]; } catch (e) { continue; }
+                if (typeof fn !== 'function' || fn._mp || SKIP_SPAWN.test(key)) continue;
+                try { if (!Object.getOwnPropertyDescriptor(spawn, key).writable) continue; } catch (e) { continue; }
+                const w = function (...args) {
+                    if (S.inPuppet && !S.replay) return undefined;   // puppets never spawn on their own
+                    if (!S.isHost && !S.buildingLevel && !S.replay) return undefined; // runtime enemy spawns are host-authoritative
+                    const before = mob.length;
+                    const r = fn.apply(this, args);
+                    try {
+                        const grp = ++S.grp;
+                        for (let i = before; i < mob.length; i++) {
+                            const mo = mob[i]; if (!mo || mo.isGhost || mo._mt) continue;
+                            mo._mt = key; mo._ma = safeArgs(args); mo._grp = grp;
+                            if (S.replay) S.replayNew.push(mo);
+                        }
+                    } catch (e) { }
+                    return r;
+                };
+                w._mp = true; spawn[key] = w;
+            }
+        }
+        function buildSpawnEvents(list) {
+            const groups = new Map(), out = [];
+            for (const mo of list) {
+                if (!mo || !mo.alive || mo._nid === undefined) continue;
+                if (mo._grp && mo._mt && mo._ma) { if (!groups.has(mo._grp)) groups.set(mo._grp, []); groups.get(mo._grp).push(mo); }
+                else out.push({ ids: [mo._nid], k: null, x: q(mo.position.x), y: q(mo.position.y), r: q(mo.radius || 25), f: mo.fill || '#888' });
+            }
+            for (const arr of groups.values()) out.push({ ids: arr.map(mo => mo._nid), k: arr[0]._mt, a: arr[0]._ma, x: q(arr[0].position.x), y: q(arr[0].position.y) });
+            return out;
+        }
+        function applySpawnEvents(list) {
+            for (const ev of list || []) {
+                if (ev.ids.every(id => { const e = mobMap.get(id); return e && e.alive && mob.includes(e); })) continue;
+                let made = [];
+                if (ev.k && ev.a && typeof spawn[ev.k] === 'function') {
+                    S.replay = true; S.replayNew = [];
+                    try { spawn[ev.k](...ev.a); } catch (e) { S.lastReplayError = ev.k + ': ' + (e && e.message); if ((errCount.replay | 0) < 5) { errCount.replay = (errCount.replay | 0) + 1; console.warn('[MP] could not replay spawn ' + ev.k, e); } } finally { S.replay = false; }
+                    made = S.replayNew; S.replayNew = [];
+                } else {
+                    try {
+                        const before = mob.length;
+                        S.replay = true;
+                        mobs.spawn(ev.x, ev.y, 8, ev.r || 25, ev.f || '#888');
+                        if (mob.length > before) {
+                            const g = mob[mob.length - 1];
+                            if (typeof g.do !== 'function') g.do = function () { if (typeof this.checkStatus === 'function') this.checkStatus(); };
+                            made = [g];
+                        }
+                    } catch (e) { }
+                    finally { S.replay = false; }
+                }
+                // Replaying one spawn can create SIDE-EFFECT mobs first (a boss's orbiting orbs, shields, babies...). Those have their own
+                // ids/events on the host, so they must not take this event's ids: pick the mobs the function itself made (same _mt), the
+                // rest are removed. (Matching by creation order used to give the boss's id to an orb and delete the boss.)
+                const own = ev.k ? made.filter(mo => mo._mt === ev.k) : made;
+                const targets = own.length ? own : made;
+                for (const mo of made) {
+                    const i = targets.indexOf(mo);
+                    if (i !== -1 && i < ev.ids.length) { mo._nid = ev.ids[i]; mobMap.set(mo._nid, mo); puppetize(mo); }
+                    else killSilently(mo);
+                }
+            }
+        }
+        function puppetize(mo) {
+            if (!mo || mo.isGhost || mo._puppet || mo._nid === undefined) return;
+            mo._puppet = true; mo._orig = {};
+            for (const k of PUPPET_NOOPS) if (typeof mo[k] === 'function') { mo._orig[k] = mo[k]; mo[k] = NOOP; }
+            mo._origDrop = mo.isDropPowerUp; mo.isDropPowerUp = false;   // the host spawns drops
+            mo._origDamage = mo.damage; mo._realDeath = mo.death;
+            mo.damage = function (d, pierce) {
+                const e = dmgOut.get(this._nid) || [0, 0]; e[0] += d; e[1] = (e[1] || pierce) ? 1 : 0; dmgOut.set(this._nid, e);
+                const keep = this.death; this.death = NOOP;   // death only comes from the host
+                try { return mo._origDamage.call(this, d, pierce); } finally { this.death = keep; }
+            };
+            mo._buf = [];
+        }
+        function unpuppetize(mo) {
+            if (!mo || !mo._puppet) return;
+            for (const k in mo._orig) mo[k] = mo._orig[k];
+            mo.damage = mo._origDamage; mo.death = mo._realDeath; mo.isDropPowerUp = mo._origDrop;
+            mo._puppet = false; mo._orig = null; mo._buf = null;
+        }
+        function applyMobs(list) {
+            if (!Array.isArray(list)) return;
+            const t = now();
+            for (const e of list) {
+                if (!Array.isArray(e) || e.length < 7 || typeof e[0] !== 'string' || !e.slice(1, 7).every(Number.isFinite)) continue;
+                const mo = mobMap.get(e[0]); if (!mo || !mo.alive || !mo._buf) continue;
+                mo._buf.push({ t, x: e[1], y: e[2], vx: e[3] / 100, vy: e[4] / 100, a: e[5] / 1000 });
+                if (mo._buf.length > 6) mo._buf.shift();
+                mo.health = e[6] / 1000;
+            }
+        }
+        // host: all mobs chase the nearest ACTIVE player, not just the host's player
+        function retarget() {
+            if (simulation.cycle % 4) return;
+            const targets = [];
+            if (m.alive && !m.isCloak && !S.dead) targets.push(player.position);
+            for (const g of ghosts.values()) { const p = S.peers.get(g.gid); if (p && p.alive && !p.dead && !peerPaused(p) && g.position) targets.push(g.position); }
+            if (targets.length < 2) return;
+            for (const mo of mob) {
+                if (!mo || mo.isGhost || !mo.alive || !mo.seePlayer || mo._puppet) continue;
+                const sp = mo.seePlayer; let best = null, bd2 = mo.alertRange2 || 1e12;
+                for (const tp of targets) {
+                    const dx = tp.x - mo.position.x, dy = tp.y - mo.position.y, d2 = dx * dx + dy * dy;
+                    if (d2 < bd2) { try { if (Matter.Query.ray(map, mo.position, tp).length) continue; } catch (e) { continue; } bd2 = d2; best = tp; }
+                }
+                if (best && (sp.yes || best !== player.position)) {
+                    sp.position.x = best.x; sp.position.y = best.y; sp.yes = true;
+                    if (typeof sp.recall === 'number') sp.recall = Math.max(sp.recall, 30);
+                }
+            }
+        }
+        const doRetarget = guard('retarget', retarget);
+        // Mob death runs in "mob phase": ephemera / effects it creates are the mob's own visuals (every client plays them from the death event),
+        // so they must not be tagged as the local player's effects and mirrored a second time.
+        function wrapMobDeath(mo) {
+            const d0 = mo.death;
+            if (typeof d0 !== 'function' || d0 === NOOP || mo._dw) return;
+            mo._dw = true;
+            mo.death = function () { S.mobPhase = (S.mobPhase | 0) + 1; try { return d0.apply(this, arguments); } finally { S.mobPhase--; } };
+        }
+        const ensureDo = guard('ensureDo', () => { for (let i = 0; i < mob.length; i++) { const mo = mob[i]; if (!mo) continue; if (typeof mo.do !== 'function') mo.do = NOOP; if (!mo._dw && !mo.isGhost && !mo._puppet) wrapMobDeath(mo); } });
+        wrapFn(mobs, 'loop', 'mobs.loop', orig => function () {
+            ensureDo();
+            if (!S.isHost) { S.inPuppet = true; try { return orig.apply(this, arguments); } finally { S.inPuppet = false; } }
+            const r = orig.apply(this, arguments);
+            if (ghosts.size) doRetarget();
+            return r;
+        });
+
+        // ------------------------------------------------------------------ safety net
+        function finiteBody(bd) {
+            if (!bd || !bd.position || !Number.isFinite(bd.position.x) || !Number.isFinite(bd.position.y)) return false;
+            const vt = bd.vertices; if (!vt) return true;
+            for (let i = 0; i < vt.length; i++) if (!Number.isFinite(vt[i].x) || !Number.isFinite(vt[i].y)) return false;
+            return true;
+        }
+        function dropBody(bd) {
+            try { removeBodyAndConstraints(bd); } catch (e) { try { Composite.remove(engine.world, bd, true); } catch (er) { } }
+            for (const arr of [mob, body, powerUp, bullet]) { const i = arr.indexOf(bd); if (i !== -1) arr.splice(i, 1); }
+        }
+        const sanitizeWorld = guard('sanitize', () => {
+            let bad = null;
+            for (const bd of Composite.allBodies(engine.world)) if (!finiteBody(bd)) (bad = bad || []).push(bd);
+            if (bad) { for (const bd of bad) dropBody(bd); console.warn('[MP] removed ' + bad.length + ' body/bodies with invalid geometry'); }
+        });
+        Matter.Events.on(engine, 'beforeUpdate', guard('beforeUpdate', () => { if (S.tickN !== S._lastSan) { S._lastSan = S.tickN; sanitizeWorld(); } }));
+
+        // ------------------------------------------------------------------ blocks & power ups
+        function descBody(bd) {
+            const cos = Math.cos(-bd.angle), sin = Math.sin(-bd.angle), cx = bd.position.x, cy = bd.position.y, v = [];
+            for (const vt of bd.vertices) { const dx = vt.x - cx, dy = vt.y - cy; v.push(q(dx * cos - dy * sin, 10), q(dx * sin + dy * cos, 10)); }
+            return [bd._nid, q(cx, 10), q(cy, 10), q(bd.angle, 1000), v, bd.friction, bd.frictionAir, bd.restitution, bd.density, bd.isPrinted ? 1 : 0];
+        }
+        function createBody(e) {
+            if (bodyMap.has(e[0])) return bodyMap.get(e[0]);
+            if (!Array.isArray(e[4]) || e[4].length < 6 || e[4].length > 200) return null;
+            const verts = []; for (let i = 0; i + 1 < e[4].length; i += 2) verts.push({ x: e[4][i] / 10, y: e[4][i + 1] / 10 });
+            if (!verts.every(v => Number.isFinite(v.x) && Number.isFinite(v.y)) || !Number.isFinite(e[1]) || !Number.isFinite(e[2])) return null;
+            let bd = null;
+            try {
+                bd = Bodies.fromVertices(e[1] / 10, e[2] / 10, [verts], {
+                    friction: Number.isFinite(e[5]) ? e[5] : 0.1, frictionAir: Number.isFinite(e[6]) ? e[6] : 0.01, restitution: Number.isFinite(e[7]) ? e[7] : 0,
+                    collisionFilter: { category: cat.body, mask: cat.player | cat.map | cat.body | cat.bullet | cat.mob | cat.mobBullet }
+                });
+            } catch (er) { }
+            if (!bd) return null;
+            if (Number.isFinite(e[8]) && e[8] > 0) Body.setDensity(bd, e[8]);
+            Body.setAngle(bd, (e[3] || 0) / 1000); Body.setPosition(bd, { x: e[1] / 10, y: e[2] / 10 });
+            if (!finiteBody(bd)) return null;
+            bd.classType = 'body'; bd._nid = e[0]; if (e[9] === 1) bd.isPrinted = true;
+            Composite.add(engine.world, bd); body.push(bd); bodyMap.set(e[0], bd);
+            return bd;
+        }
+        function claim(bd) { bd._owner = S.id; bd._ownAt = now(); opsQ.push(['c', bd._nid]); }
+        // pushing a block that somebody else owns: take it over the moment our body touches it (no need to grab it or wait for the proximity scan)
+        const claimOnTouch = guard('claimTouch', ev => {
+            if (!S.inGame || S.loading || S.solo || S.dead || S.applying || !hasPeers() || !player) return;
+            for (const pr of ev.pairs) {
+                const o = pr.bodyA === player ? pr.bodyB : (pr.bodyB === player ? pr.bodyA : null);
+                if (!o || o._nid === undefined || o._owner === S.id || o.isStatic || o._gone || o.isGhost || o.isNotHoldable) continue;
+                if (now() - (o._ownAt || 0) < 400) continue;                                   // two players leaning on one block must not fight over it every frame
+                claim(o);
+            }
+        });
+        Matter.Events.on(engine, 'collisionStart', claimOnTouch);
+        Matter.Events.on(engine, 'collisionActive', claimOnTouch);
+        function applyBlocks(p, list) {
+            if (!Array.isArray(list)) return;
+            const fromHost = isHostPeer(p);
+            for (const e of list) {
+                if (!Array.isArray(e) || e.length < 7 || typeof e[0] !== 'string' || !e.slice(1, 7).every(Number.isFinite)) continue;
+                const bd = bodyMap.get(e[0]);
+                if (!bd || bd === m.holdingTarget) continue;
+                if (fromHost) { if (bd._owner !== null && bd._owner !== p.id) continue; }
+                else if (bd._owner !== p.id) continue;
+                const nx = e[1] / 10, ny = e[2] / 10, dx = nx - bd.position.x, dy = ny - bd.position.y;
+                if (dx * dx + dy * dy > 6400) Body.setPosition(bd, { x: nx, y: ny });
+                else Body.setPosition(bd, { x: bd.position.x + dx * 0.6, y: bd.position.y + dy * 0.6 });
+                Body.setAngle(bd, e[3] / 1000);
+                Body.setVelocity(bd, { x: e[4] / 100, y: e[5] / 100 });
+                Body.setAngularVelocity(bd, e[6] / 1000);
+            }
+        }
+        function scanWorld() {
+            const cur = new Set();
+            for (const bd of body) {
+                if (!bd) continue;
+                if (bd._nid === undefined) {
+                    bd._nid = 'D' + LC() + '_' + S.id + '_' + (S.ctr++); bd._owner = S.id; bodyMap.set(bd._nid, bd);
+                    if (!bd.isNotHoldable) opsQ.push(['a', descBody(bd)]);
+                }
+                cur.add(bd._nid);
+            }
+            for (const [id, bd] of bodyMap) if (!cur.has(id)) { bodyMap.delete(id); if (!bd._gone && !bd.isNotHoldable) opsQ.push(['r', id]); }
+            const h = m.holdingTarget; if (h && h._nid !== undefined && h._owner !== S.id) claim(h);
+            // fields reach further than 120px (field range, pilot wave's roaming field): take ownership of what OUR field is moving
+            const reach = Math.max(120, (Number(m.fieldRange) || 0) + 40);
+            const pw = (m.fieldMode === 8 && input.field && m.fieldPosition && Number.isFinite(m.fieldRadius)) ? m.fieldPosition : null;
+            if (player && player.position) for (const bd of bodyMap.values()) {
+                if (bd._owner === S.id) continue;
+                if (pw && Math.hypot(bd.position.x - pw.x, bd.position.y - pw.y) < m.fieldRadius * 1.3 + 40 && !bd.isNotHoldable) { claim(bd); continue; }
+                const dx = bd.position.x - player.position.x, dy = bd.position.y - player.position.y;
+                if (dx * dx + dy * dy >= reach * reach) continue;
+                // Levers/toggles are deliberately non-holdable bodies, but their rotation
+                // still needs an owner so the host can accept and replicate the interaction.
+                const moving = Number(bd.speed) > 0.35 || Math.abs(Number(bd.angularVelocity) || 0) > 0.0015;
+                if (moving && (!bd.isNotHoldable || Math.abs(Number(bd.angularVelocity) || 0) > 0.0015)) claim(bd);
+            }
+            if (S.isHost) {
+                const curM = new Set(), fresh = [];
+                for (const mo of mob) {
+                    if (!mo || mo.isGhost) continue;
+                    if (mo._nid === undefined) { mo._nid = 'D' + LC() + '_' + S.id + '_' + (S.ctr++); mobMap.set(mo._nid, mo); fresh.push(mo); }
+                    if (mo.alive) curM.add(mo._nid);
+                }
+                if (fresh.length) for (const ev of buildSpawnEvents(fresh)) spawnQ.push(ev);
+                if (S.aliveIds) for (const id of S.aliveIds) if (!curM.has(id)) deathQ.push(id);
+                S.aliveIds = curM;
+            }
+        }
+
+        // ------------------------------------------------------------------ mob effects from guests (v10-B)
+        // A guest's mobs are puppets: pushes / forces / stun / slow / DoT applied by the guest's fields and weapons would be
+        // overwritten by the host's positions. We measure what OUR attack phases did to puppets and forward it to the host.
+        let mfxQ = [];
+        const impOut = new Map();   // netId -> [dvx, dvy, dfx, dfy]
+        function impSnap() {
+            if (S.isHost || !S.inGame || S.loading || S.solo) return null;
+            const r = [];
+            for (const mo of mobMap.values()) {
+                if (!mo || !mo._puppet || !mo.alive || !mo.velocity || !mo.force) continue;
+                r.push(mo, mo.velocity.x, mo.velocity.y, mo.force.x, mo.force.y);
+            }
+            return r.length ? r : null;
+        }
+        function impDiff(snap) {
+            if (!snap) return;
+            for (let i = 0; i < snap.length; i += 5) {
+                const mo = snap[i]; if (!mo.alive || mo._nid === undefined) continue;
+                const dvx = mo.velocity.x - snap[i + 1], dvy = mo.velocity.y - snap[i + 2], dfx = mo.force.x - snap[i + 3], dfy = mo.force.y - snap[i + 4];
+                if (Math.abs(dvx) + Math.abs(dvy) < 0.05 && Math.abs(dfx) + Math.abs(dfy) < 1e-7) continue;
+                const e = impOut.get(mo._nid) || [0, 0, 0, 0];
+                e[0] += dvx; e[1] += dvy; e[2] += dfx; e[3] += dfy; impOut.set(mo._nid, e);
+            }
+        }
+        function installMobFx() {
+            const stat = (key, label, defCycles) => wrapFn(mobs, key, label, orig => function (who, a, b2) {
+                try {
+                    if (!S.isHost && who && who._puppet && who._nid !== undefined && !(S.netCtx > 0) && hasPeers()) {
+                        if (key === 'statusDoT') mfxQ.push([who._nid, 'dt', Number(a) || 0, Number(b2) || defCycles]);
+                        else mfxQ.push([who._nid, key === 'statusStun' ? 'st' : 'sl', Number(a) || defCycles]);
+                    }
+                } catch (e) { }
+                return orig.apply(this, arguments);
+            });
+            stat('statusStun', 'mp.statusStun', 180); stat('statusSlow', 'mp.statusSlow', 60); stat('statusDoT', 'mp.statusDoT', 180);
+        }
+        H.mfx = (p, d) => {
+            if (!S.isHost || S.solo || !S.peers.has(p.id) || (d.lc | 0) !== LC() || !Array.isArray(d.l) || p.dead) return;
+            if (Number.isInteger(d.q)) { if (d.q <= (p.mfxQ | 0)) return; p.mfxQ = d.q; }
+            for (const e of d.l.slice(0, 120)) {
+                if (!Array.isArray(e) || typeof e[0] !== 'string') continue;
+                const mo = mobMap.get(e[0]); if (!mo || !mo.alive || mo._puppet) continue;
+                const n = e.slice(2).map(Number); if (!n.every(Number.isFinite)) continue;
+                try {
+                    if (e[1] === 'v') Body.setVelocity(mo, { x: mo.velocity.x + Math.max(-60, Math.min(60, n[0])), y: mo.velocity.y + Math.max(-60, Math.min(60, n[1])) });
+                    else if (e[1] === 'f') { mo.force.x += Math.max(-5, Math.min(5, n[0])); mo.force.y += Math.max(-5, Math.min(5, n[1])); }
+                    else if (e[1] === 'st') mobs.statusStun(mo, Math.max(1, Math.min(900, n[0])));
+                    else if (e[1] === 'sl') mobs.statusSlow(mo, Math.max(1, Math.min(900, n[0])));
+                    else if (e[1] === 'dt') mobs.statusDoT(mo, Math.max(0, Math.min(100, n[0])), Math.max(1, Math.min(900, n[1] || 180)));
+                } catch (er) { }
+            }
+        };
+        function flushMobFx() {
+            for (const [id, e] of impOut) {
+                if (Math.abs(e[0]) + Math.abs(e[1]) >= 0.05) mfxQ.push([id, 'v', +e[0].toFixed(2), +e[1].toFixed(2)]);
+                if (Math.abs(e[2]) + Math.abs(e[3]) >= 1e-7) mfxQ.push([id, 'f', +e[2].toFixed(6), +e[3].toFixed(6)]);
+            }
+            impOut.clear();
+            if (mfxQ.length) { sendEv({ t: 'mfx', lc: LC(), q: ++S.mfxSeq, l: mfxQ.slice(0, 120) }, S.hostId); mfxQ = []; }
+        }
+
+        // ------------------------------------------------------------------ visual mirror (v10)
+        // Every weapon / field / tech effect in n-gon is drawn with plain canvas calls inside a handful of loop phases
+        // (b.fire, m.hold, each bullet.do, each ephemera.do). We record the canvas commands those phases issue for OUR player,
+        // send them as compact text, and replay them in world space on everybody else's screen. This covers every gun, field,
+        // bot, laser, drone, tech trail ... generically, with no per-item code, so new items "just work".
+        const VM = { cur: null, bad: false, active: false, frame: 0, sentFrame: 0, gid: 0, latest: new Map(), grads: 0, epArr: null, depthRec: 0 };
+        const vmNum = (v, d) => { const n = Number(v); return Number.isFinite(n) ? String(+n.toFixed(d)) : '0'; };
+        const vmCol = c => '~' + String(c).replace(/[;,]/g, m => m === ',' ? '|' : '').slice(0, 60);
+        const VM_COLOR = /^(rgba?\([0-9., %\-\/]+\)|hsla?\([0-9., %\-\/deg]+\)|#[0-9a-fA-F]{3,8}|[a-zA-Z]{3,24})$/;
+        const VM_COMP = new Set(['source-over', 'lighter', 'multiply', 'screen', 'overlay', 'destination-out', 'source-atop', 'xor', 'difference', 'exclusion', 'darken', 'lighten', 'color-dodge', 'color-burn', 'hard-light', 'soft-light', 'hue', 'saturation', 'color', 'luminosity']);
+        const VM_CAP = new Set(['butt', 'round', 'square']), VM_JOIN = new Set(['miter', 'round', 'bevel']);
+        const VM_ARGS = { B: 0, Z: 0, M: 2, L: 2, A: 6, E: 8, Q: 4, C: 6, R: 4, T: 5, F: 0, S: 0, P: 4, O: 4, V: 0, W: 0, X: 2, Y: 1, D: 2, U: 6, K: 0, a: 1, e: 1, h: 1, J: 1, l: 1 };
+        function vmStr(code, args, prec) {
+            let s = code; if (args) { for (let i = 0; i < args.length; i++) s += (i ? ',' : '') + (typeof args[i] === 'string' ? args[i] : vmNum(args[i], prec == null ? 1 : prec)); }
+            return s;
+        }
+        function vmRec(code, args, prec) {
+            const c = VM.cur; if (!c || c.ops.length > 5000) return;
+            c.ops.push(vmStr(code, args, prec));
+        }
+        function installRecorder() {
+            if (ctx._mpRec) return; ctx._mpRec = true;
+            const proto = Object.getPrototypeOf(ctx);
+            const meth = (name, code, prec, fix) => {
+                const orig = ctx[name]; if (typeof orig !== 'function') return;
+                ctx[name] = function () {
+                    if (VM.cur) { try { vmRec(code, fix ? fix(arguments) : arguments, prec); } catch (e) { } }
+                    return orig.apply(ctx, arguments);
+                };
+            };
+            meth('beginPath', 'B'); meth('closePath', 'Z'); meth('moveTo', 'M'); meth('lineTo', 'L');
+            meth('arc', 'A', 3, a => [a[0], a[1], a[2], a[3], a[4], a[5] ? 1 : 0]);
+            meth('ellipse', 'E', 3, a => [a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7] ? 1 : 0]);
+            meth('quadraticCurveTo', 'Q'); meth('bezierCurveTo', 'C'); meth('rect', 'R'); meth('arcTo', 'T');
+            meth('fill', 'F', 1, () => []); meth('stroke', 'S'); meth('fillRect', 'P'); meth('strokeRect', 'O');
+            meth('save', 'V'); meth('restore', 'W'); meth('translate', 'X'); meth('rotate', 'Y', 4); meth('scale', 'D', 4); meth('transform', 'U', 4);
+            meth('clip', 'K', 1, () => []);
+            meth('setLineDash', 'I', 1, a => (Array.isArray(a[0]) ? a[0].slice(0, 6) : []));
+            meth('fillText', 't', 1, a => [encodeURIComponent(String(a[0]).slice(0, 40)), a[1], a[2]]);
+            for (const n of ['setTransform', 'resetTransform', 'reset', 'drawImage', 'putImageData', 'createPattern']) {
+                const orig = ctx[n]; if (typeof orig !== 'function') continue;
+                ctx[n] = function () { if (VM.cur && n !== 'createPattern') VM.bad = true; return orig.apply(ctx, arguments); };
+            }
+            const mkGrad = (name, code) => {
+                const orig = ctx[name]; if (typeof orig !== 'function') return;
+                ctx[name] = function () {
+                    const g = orig.apply(ctx, arguments);
+                    if (g) {
+                        g._vid = (VM.grads = (VM.grads + 1) % 1000000) + 1;
+                        const args = [g._vid, ...arguments];
+                        g._def = [vmStr(code, args, 1)];                                   // remembered, so a gradient made OUTSIDE a recorded phase (m.bodyGradient) can still be sent
+                        if (VM.cur) { VM.cur.ops.push(g._def[0]); (VM.cur.em || (VM.cur.em = new Set())).add(g._vid); }
+                        const add = g.addColorStop;
+                        g.addColorStop = function (o, col) {
+                            try { const st = vmStr('s', [g._vid, vmNum(o, 3), vmCol(col)]); if (g._def.length < 12) g._def.push(st); if (VM.cur && VM.cur.em && VM.cur.em.has(g._vid)) VM.cur.ops.push(st); } catch (e) { }
+                            return add.call(g, o, col);
+                        };
+                    }
+                    return g;
+                };
+            };
+            mkGrad('createLinearGradient', 'q'); mkGrad('createRadialGradient', 'r');
+            const prop = (name, code, kind) => {
+                const d = Object.getOwnPropertyDescriptor(proto, name); if (!d || !d.set) return;
+                Object.defineProperty(ctx, name, {
+                    configurable: true, enumerable: true,
+                    get() { return d.get.call(ctx); },
+                    set(v) {
+                        if (VM.cur) {
+                            if (kind === 'col') { if (typeof v === 'string') vmRec(code, [vmCol(v)]); else if (v && v._vid) {
+                                const c = VM.cur;
+                                if (v._def && !(c.em && c.em.has(v._vid))) { for (const d of v._def) c.ops.push(d); (c.em || (c.em = new Set())).add(v._vid); }
+                                vmRec(code, ['@' + v._vid]);
+                            } }
+                            else if (kind === 'str') vmRec(code, [String(v).replace(/[;,]/g, '')]);
+                            else vmRec(code, [v], 3);
+                        }
+                        d.set.call(ctx, v);
+                    }
+                });
+            };
+            prop('globalAlpha', 'a', 'num'); prop('fillStyle', 'c', 'col'); prop('strokeStyle', 'd', 'col'); prop('lineWidth', 'e', 'num');
+            prop('lineCap', 'f', 'str'); prop('lineJoin', 'g', 'str'); prop('miterLimit', 'h', 'num'); prop('globalCompositeOperation', 'i', 'str');
+            prop('lineDashOffset', 'J', 'num'); prop('font', 'k', 'str'); prop('shadowBlur', 'l', 'num'); prop('shadowColor', 'm', 'col'); prop('textAlign', 'n', 'str');
+        }
+        function vmBegin(kind, key, ax, ay, vx, vy) {
+            if (VM.cur) return false;
+            VM.cur = { kind, key, ax: ax || 0, ay: ay || 0, vx: vx || 0, vy: vy || 0, ops: [] }; VM.bad = false; return true;
+        }
+        function vmEnd() {
+            const c = VM.cur; VM.cur = null; if (!c) return;
+            if (c.ops.length && !VM.bad) {
+                const str = c.ops.join(';'), prev = VM.latest.get(c.key);
+                // A one-frame flash can be overwritten by the next, plainer frame before the next 20 Hz packet leaves. Remember the
+                // most elaborate drawing since the last packet and send it as a short "flash" group as well.
+                let pk = null;
+                if (prev && prev.f >= VM.sentFrame) {
+                    pk = prev.pk;
+                    const cand = prev.s, cur = pk ? pk.s : null;
+                    if (cand.length > str.length * 1.3 + 60 && (!cur || cand.length > cur.length)) pk = { s: cand, ax: prev.ax, ay: prev.ay, vx: prev.vx, vy: prev.vy };
+                    else if (str.length > cand.length * 1.3 + 60 && (!cur || str.length > cur.length)) pk = { s: str, ax: c.ax, ay: c.ay, vx: c.vx, vy: c.vy };
+                }
+                VM.latest.set(c.key, { k: c.kind, ax: c.ax, ay: c.ay, vx: c.vx, vy: c.vy, s: str, f: VM.frame, pk });
+            }
+        }
+        function vmPhase(obj, key, gkey, kind) {
+            if (!obj || typeof obj[key] !== 'function') { HOOKS['vm.' + gkey] = false; return; }
+            let raw = obj[key];
+            const wrapper = function () {
+                if (gkey === 'skin' && S.dead && !S.solo) return;                       // an eliminated player's own body is not drawn (it would float above the teammate being spectated)
+                if (!VM.active || VM.cur) return raw.apply(this, arguments);
+                const p = m.pos || player.position;
+                vmBegin(kind, gkey, p.x, p.y, 0, 0);
+                const snap = impSnap();
+                try { return raw.apply(this, arguments); } finally { vmEnd(); impDiff(snap); }
+            };
+            Object.defineProperty(obj, key, { configurable: true, enumerable: true, get() { return wrapper; }, set(f) { if (f !== wrapper && typeof f === 'function') raw = f; } });
+            HOOKS['vm.' + gkey] = true;
+        }
+        function installPhases() {
+            vmPhase(m, 'hold', 'hold', 0);
+            vmPhase(m, 'draw', 'skin', 0);                 // the player's real body / legs / skin, whatever skin or tech changed it
+            vmPhase(b, 'fire', 'fire', 0);
+            // per-bullet groups (own velocity => smooth extrapolation on the other screens)
+            const rawBD = b.bulletDo;
+            if (typeof rawBD === 'function' && /bullet\[i\]\.do\(\)/.test(Function.prototype.toString.call(rawBD))) {
+                let raw = rawBD;
+                const wrapper = function () {
+                    if (!VM.active || VM.cur) return raw.apply(this, arguments);
+                    const snap = impSnap();
+                    for (let i = 0, len = bullet.length; i < len; i++) {
+                        const bl = bullet[i]; if (!bl) continue;
+                        if (!bl._vid) bl._vid = ++VM.gid;
+                        const v = bl.velocity || { x: 0, y: 0 }, pos = bl.position || { x: 0, y: 0 };
+                        vmBegin(1, 'b' + bl._vid, pos.x, pos.y, v.x, v.y);
+                        try { bl.do(); } finally { vmEnd(); }
+                    }
+                    impDiff(snap);
+                };
+                Object.defineProperty(b, 'bulletDo', { configurable: true, enumerable: true, get() { return wrapper; }, set(f) { if (f !== wrapper && typeof f === 'function') raw = f; } });
+                HOOKS['vm.bulletDo'] = true;
+            } else HOOKS['vm.bulletDo'] = false;
+            // ephemera created by OUR player's code (not by the level, mobs or network handlers) are mirrored too
+            const rawEph = simulation.runEphemera;
+            if (typeof rawEph === 'function' && /ephemera\[i\]/.test(Function.prototype.toString.call(rawEph))) {
+                let raw = rawEph;
+                const tagArr = () => {
+                    const arr = simulation.ephemera;
+                    if (!Array.isArray(arr) || VM.epArr === arr) return;
+                    VM.epArr = arr; const push = Array.prototype.push;
+                    arr.push = function () { if (!(S.levelPhase > 0 || S.mobPhase > 0 || S.netCtx > 0)) for (let i = 0; i < arguments.length; i++) { const x = arguments[i]; if (x && typeof x === 'object') x._own = 1; } return push.apply(this, arguments); };
+                };
+                const wrapper = function () {
+                    tagArr();
+                    if (!VM.active || VM.cur) return raw.apply(this, arguments);
+                    const snap = impSnap();
+                    for (let i = simulation.ephemera.length - 1; i >= 0; i--) {
+                        const e = simulation.ephemera[i]; if (!e) continue;
+                        if (e._own) {
+                            if (!e._vid) e._vid = ++VM.gid;
+                            vmBegin(2, 'e' + e._vid, 0, 0, 0, 0);
+                            try { e.do(); } finally { vmEnd(); }
+                        } else e.do();
+                    }
+                    impDiff(snap);
+                };
+                Object.defineProperty(simulation, 'runEphemera', { configurable: true, enumerable: true, get() { return wrapper; }, set(f) { if (f !== wrapper && typeof f === 'function') raw = f; } });
+                HOOKS['vm.ephemera'] = true;
+            } else HOOKS['vm.ephemera'] = false;
+            wrapFn(mobs, 'loop', 'vm.mobs.loop', orig => function () { S.mobPhase = (S.mobPhase | 0) + 1; try { return orig.apply(this, arguments); } finally { S.mobPhase--; } });
+            wrapFn(level, 'start', 'vm.level.start', orig => function () { S.levelPhase = (S.levelPhase | 0) + 1; try { return orig.apply(this, arguments); } finally { S.levelPhase--; } });
+        }
+        function installVisualMirror() {
+            try { installRecorder(); installPhases(); installMobFx(); wrapFn(b, 'bulletDraw', 'mp.timeDilatedGhosts', orig => function () { const r = orig.apply(this, arguments); try { if (m.isTimeDilated && S.inGame && !S.solo) for (const g of ghosts.values()) if (g && g.do) g.do(); } catch (e) { } return r; }); } catch (e) { console.warn('[MP] visual mirror failed to install', e); }
+            Matter.Events.on(engine, 'afterUpdate', () => {
+                VM.frame++;
+                VM.active = !!(S.inGame && !S.loading && !S.solo && !S.paused && !S.dead && hasPeers());
+            });
+        }
+        // serialise what was drawn since the last packet (kind 0 first: field / gun, then bullets, then ephemera)
+        function vmSnap() {
+            const out = []; let size = 0;
+            const items = [...VM.latest.entries()].filter(([k, g]) => g.f >= VM.sentFrame).sort((a, b2) => a[1].k - b2[1].k);
+            for (const [k, g] of items) {
+                if (size + g.s.length > 9000) break;
+                size += g.s.length + 40;
+                out.push([g.k, k, q(g.ax, 10) / 10, q(g.ay, 10) / 10, q(g.vx, 100) / 100, q(g.vy, 100) / 100, g.s]);
+                if (g.pk && g.f >= VM.sentFrame && size + g.pk.s.length < 9000) {                      // flash group: kind 10 + original kind
+                    size += g.pk.s.length + 40;
+                    out.push([10 + g.k, k + '*', q(g.pk.ax, 10) / 10, q(g.pk.ay, 10) / 10, q(g.pk.vx, 100) / 100, q(g.pk.vy, 100) / 100, g.pk.s]);
+                }
+                g.pk = null;
+            }
+            VM.sentFrame = VM.frame + 1;
+            for (const [k, g] of VM.latest) if (g.f < VM.frame - 40) VM.latest.delete(k);
+            return out;
+        }
+        function vmParse(list, st) {
+            if (!Array.isArray(list)) return null;
+            const groups = []; let total = 0, hasHold = false;
+            for (const e of list.slice(0, 160)) {
+                if (!Array.isArray(e) || e.length < 7 || typeof e[6] !== 'string' || e[6].length > 6000) continue;
+                const kind = e[0] | 0, ax = Number(e[2]), ay = Number(e[3]), vx = Number(e[4]), vy = Number(e[5]);
+                if (![ax, ay, vx, vy].every(Number.isFinite) || Math.abs(vx) > 500 || Math.abs(vy) > 500) continue;
+                const ops = [];
+                for (const part of e[6].split(';')) {
+                    if (!part) continue;
+                    const code = part[0], a = part.length > 1 ? part.slice(1).split(',') : [];
+                    let op = null;
+                    if (code in VM_ARGS) {
+                        if (a.length !== VM_ARGS[code]) continue;
+                        const n = a.map(Number); if (!n.every(Number.isFinite) || n.some(v => Math.abs(v) > 1e7)) continue;
+                        if (code === 'A' && n[2] > 20000) continue; if (code === 'D' && (Math.abs(n[0]) > 100 || Math.abs(n[1]) > 100)) continue;
+                        op = [code, ...n];
+                    } else if (code === 'I') { const n = a.map(Number).filter(Number.isFinite).slice(0, 6); op = ['I', n]; }
+                    else if (code === 'c' || code === 'd' || code === 'm') {
+                        const v = a[0] || ''; if (v[0] === '@' && code !== 'm') op = [code, v]; else if (v[0] === '~') { const col = v.slice(1).replace(/\|/g, ','); if (VM_COLOR.test(col)) op = [code, col]; }
+                    } else if (code === 'q' && a.length === 5) { const n = a.map(Number); if (n.every(Number.isFinite)) op = ['q', ...n]; }
+                    else if (code === 'r' && a.length === 7) { const n = a.map(Number); if (n.every(Number.isFinite)) op = ['r', ...n]; }
+                    else if (code === 's' && a.length === 3) { const col = (a[2] || '').slice(1).replace(/\|/g, ','); const n0 = Number(a[0]), n1 = Number(a[1]); if (a[2] && a[2][0] === '~' && VM_COLOR.test(col) && Number.isFinite(n0) && n1 >= 0 && n1 <= 1) op = ['s', n0, n1, col]; }
+                    else if (code === 'f') { if (VM_CAP.has(a[0])) op = ['f', a[0]]; }
+                    else if (code === 'g') { if (VM_JOIN.has(a[0])) op = ['g', a[0]]; }
+                    else if (code === 'i') { if (VM_COMP.has(a[0])) op = ['i', a[0]]; }
+                    else if (code === 'k') { if (/^[0-9a-z .'"\-]{1,40}$/i.test(a[0] || '')) op = ['k', a[0]]; }
+                    else if (code === 'n') { if (['left', 'right', 'center', 'start', 'end'].includes(a[0])) op = ['n', a[0]]; }
+                    else if (code === 't' && a.length === 3) { const x = Number(a[1]), y = Number(a[2]); if (Number.isFinite(x) && Number.isFinite(y)) { let tx = ''; try { tx = decodeURIComponent(a[0]).slice(0, 40); } catch (er) { } op = ['t', tx, x, y]; } }
+                    if (op) ops.push(op);
+                }
+                total += ops.length; if (total > 8000) break;
+                if (ops.length) { groups.push({ k: kind, ax, ay, vx, vy, ops, key: String(e[1]) }); if (kind === 0) hasHold = true; }
+            }
+            return { g: groups, t: st, at: now(), hasHold };
+        }
+        function vmRun(ops) {
+            let depth = 0; const grads = new Map();
+            const style = (v) => (v[0] === '@' ? (grads.get(Number(v.slice(1))) || 'rgba(0,0,0,0)') : v);
+            for (const o of ops) {
+                const c = o[0];
+                switch (c) {
+                    case 'B': ctx.beginPath(); break; case 'Z': ctx.closePath(); break;
+                    case 'M': ctx.moveTo(o[1], o[2]); break; case 'L': ctx.lineTo(o[1], o[2]); break;
+                    case 'A': ctx.arc(o[1], o[2], Math.max(0, o[3]), o[4], o[5], !!o[6]); break;
+                    case 'E': ctx.ellipse(o[1], o[2], Math.max(0, o[3]), Math.max(0, o[4]), o[5], o[6], o[7], !!o[8]); break;
+                    case 'Q': ctx.quadraticCurveTo(o[1], o[2], o[3], o[4]); break;
+                    case 'C': ctx.bezierCurveTo(o[1], o[2], o[3], o[4], o[5], o[6]); break;
+                    case 'R': ctx.rect(o[1], o[2], o[3], o[4]); break; case 'T': ctx.arcTo(o[1], o[2], o[3], o[4], Math.max(0, o[5])); break;
+                    case 'F': ctx.fill(); break; case 'S': ctx.stroke(); break; case 'K': ctx.clip(); break;
+                    case 'P': ctx.fillRect(o[1], o[2], o[3], o[4]); break; case 'O': ctx.strokeRect(o[1], o[2], o[3], o[4]); break;
+                    case 'V': if (depth < 24) { ctx.save(); depth++; } break; case 'W': if (depth > 0) { ctx.restore(); depth--; } break;
+                    case 'X': ctx.translate(o[1], o[2]); break; case 'Y': ctx.rotate(o[1]); break; case 'D': ctx.scale(o[1], o[2]); break; case 'U': ctx.transform(o[1], o[2], o[3], o[4], o[5], o[6]); break;
+                    case 'I': ctx.setLineDash(o[1]); break;
+                    case 'a': ctx.globalAlpha = Math.max(0, Math.min(1, o[1])); break; case 'e': ctx.lineWidth = Math.max(0, Math.min(500, o[1])); break;
+                    case 'h': ctx.miterLimit = Math.max(1, Math.min(100, o[1])); break; case 'J': ctx.lineDashOffset = o[1]; break; case 'l': ctx.shadowBlur = Math.max(0, Math.min(200, o[1])); break;
+                    case 'c': ctx.fillStyle = style(o[1]); break; case 'd': ctx.strokeStyle = style(o[1]); break; case 'm': ctx.shadowColor = o[1]; break;
+                    case 'f': ctx.lineCap = o[1]; break; case 'g': ctx.lineJoin = o[1]; break; case 'i': ctx.globalCompositeOperation = o[1]; break;
+                    case 'k': ctx.font = o[1]; break; case 'n': ctx.textAlign = o[1]; break;
+                    case 't': ctx.fillText(o[1], o[2], o[3]); break;
+                    case 'q': grads.set(o[1], ctx.createLinearGradient(o[2], o[3], o[4], o[5])); break;
+                    case 'r': grads.set(o[1], ctx.createRadialGradient(o[2], o[3], Math.max(0, o[4]), o[5], o[6], Math.max(0, o[7]))); break;
+                    case 's': { const g = grads.get(o[1]); if (g) { try { g.addColorStop(o[2], o[3]); } catch (e) { } } break; }
+                }
+            }
+            while (depth-- > 0) ctx.restore();
+        }
+        const hasSkinVm = p => !!(p.vm && now() - p.vm.at < 250 && p.vm.g.some(g => g.key === 'skin'));
+        function drawVm(p) {
+            const vm = p.vm; if (!vm || !vm.g.length || now() - vm.at > 250 || VM.cur) return;
+            const cur = p.cur;
+            const fr = Math.max(-9, Math.min(8, (now() - CFG.interpMs - (Number.isFinite(vm.t) ? vm.t : vm.at)) / stepMs()));
+            for (const g0 of vm.g) {
+                const flash = g0.k >= 10;
+                if (flash && now() - vm.at > 110) continue;                                          // flashes are shown briefly, once
+                const g = flash ? { ...g0, k: g0.k - 10 } : g0;
+                let dx = 0, dy = 0;
+                if (g.k === 0) { if (!cur) continue; if (/^hold/.test(g.key) && p.fm === 7) continue; dx = cur.x - g.ax; dy = cur.y - g.ay; }   // cloaking: its big white circle is a view effect for the owner only
+                else if (g.k === 1) { dx = g.vx * fr; dy = g.vy * fr; }
+                ctx.save();
+                try {
+                    ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.lineWidth = 1; ctx.lineCap = 'butt'; ctx.lineJoin = 'miter'; ctx.setLineDash([]); ctx.shadowBlur = 0;
+                    ctx.translate(dx, dy); vmRun(g.ops);
+                } catch (e) { errCount.vm = (errCount.vm | 0) + 1; }
+                ctx.restore();
+            }
+        }
+
+        // ------------------------------------------------------------------ ghosts (other players)
+        function drawRemotePlayer(p, s, flash) {
+            const L1 = (m && m.legLength1) || 55, L2 = (m && m.legLength2) || 45, HT = (m && m.height) || 42;
+            const flip = Math.cos(s.a) >= 0 ? 1 : -1;
+            const yOff = Number.isFinite(p.yOff) ? p.yOff : 49;
+            const vx = Number.isFinite(s.vx) ? s.vx : 0;
+            p.walk = (p.walk || 0) + flip * vx;
+            p.step = 0.8 * (p.step || 0) + 0.2 * (7 * Math.sqrt(Math.min(9, Math.abs(vx))) * (p.og ? 1 : 0));
+            const fill = flash ? '#f55' : `hsl(${p.hue},55%,75%)`;
+            ctx.save();
+            ctx.translate(s.x, s.y);
+            const leg = (cycle, off, stroke) => {
+                const hx = 12 + off, hy = 24 + off;
+                const ang = 0.034 * p.walk + cycle;
+                const fx = 2.2 * p.step * Math.cos(ang) + off;
+                const fy = Math.min(yOff + HT, off + 1.2 * p.step * Math.sin(ang) + yOff + HT);
+                const dx = fx - hx, dy = fy - hy, d = Math.max(1, Math.hypot(dx, dy));
+                const l = (L1 * L1 - L2 * L2 + d * d) / (2 * d), h = Math.sqrt(Math.max(0, L1 * L1 - l * l));
+                const kx = (l / d) * dx - (h / d) * dy + hx + off, ky = (l / d) * dy + (h / d) * dx + hy;
+                ctx.save(); ctx.scale(flip, 1);
+                ctx.beginPath(); ctx.moveTo(hx, hy); ctx.lineTo(kx, ky); ctx.lineTo(fx, fy);
+                ctx.strokeStyle = stroke; ctx.lineWidth = 5; ctx.stroke();
+                const tx = p.og ? 14 : 12, ty = p.og ? 5 : 8;
+                ctx.beginPath(); ctx.moveTo(fx, fy); ctx.lineTo(fx - tx, fy + ty); ctx.moveTo(fx, fy); ctx.lineTo(fx + tx, fy + ty);
+                ctx.lineWidth = 4; ctx.stroke();
+                ctx.beginPath(); ctx.arc(hx, hy, 9, 0, 2 * Math.PI);
+                ctx.moveTo(kx + 5, ky); ctx.arc(kx, ky, 5, 0, 2 * Math.PI);
+                ctx.moveTo(fx + 4, fy + 1); ctx.arc(fx, fy + 1, 4, 0, 2 * Math.PI);
+                ctx.fillStyle = fill; ctx.fill(); ctx.strokeStyle = stroke; ctx.lineWidth = 2; ctx.stroke();
+                ctx.restore();
+            };
+            leg(Math.PI, -3, '#4a4a4a');
+            leg(0, 0, '#333');
+            ctx.rotate(s.a);
+            ctx.beginPath(); ctx.moveTo(22, 0); ctx.lineTo(44, 0); ctx.lineCap = 'round'; ctx.lineWidth = 8; ctx.strokeStyle = '#333'; ctx.stroke();   // gun
+            ctx.beginPath(); ctx.arc(0, 0, 30, 0, 2 * Math.PI);
+            ctx.fillStyle = fill; ctx.fill();
+            ctx.strokeStyle = '#333'; ctx.lineWidth = 2; ctx.stroke();
+            ctx.beginPath(); ctx.arc(15, 0, 4, 0, 2 * Math.PI); ctx.stroke();
+            ctx.restore();
+        }
+        function makeGhost(p) {
+            const before = mob.length;
+            S.creatingGhost = true;
+            try { mobs.spawn(0, 0, 12, 30, 'rgba(0,0,0,0)'); } catch (e) { return null; }
+            finally { S.creatingGhost = false; }
+            const g = mob[mob.length - 1]; if (!g || mob.length === before) return null;
+            g.isGhost = true; g.gid = p.id; g.alive = true; g.health = 1; g.damageReduction = 1;
+            g.isBadTarget = true; g.isDropPowerUp = false; g.showHealthBar = false; g.leaveBody = false; g.isUnblockable = true;
+            g.locatePlayer = NOOP; g.foundPlayer = NOOP; g.death = NOOP;
+            g.collisionFilter.category = cat.mob; g.collisionFilter.mask = cat.bullet | cat.body;
+            Body.setStatic(g, true);
+            g.damage = function (d) {
+                const pp = S.peers.get(this.gid);
+                if (!pp || !S.pvp || !pp.pvp || !pp.alive || pp.dead || pp.imm || peerPaused(pp) || !Number.isFinite(d)) return;   // paused players are invulnerable
+                pvpOut.set(pp.id, (pvpOut.get(pp.id) || 0) + d * CFG.pvpScale);
+                this._flash = 4;
+            };
+            g.do = guard('ghost.do', function () {
+                const pp = S.peers.get(this.gid); if (!pp) return;
+                const pz = peerPaused(pp);
+                this.isInvulnerable = pz || pp.imm || !(S.pvp && pp.pvp && pp.alive);
+                const wantMask = (pp.alive && !pp.dead) ? (cat.bullet | cat.body) : 0;      // eliminated / spectating players are not solid and cannot block shots
+                if (this.collisionFilter.mask !== wantMask) this.collisionFilter.mask = wantMask;
+                if (!pz) drawPeerBullets(pp);
+                const s = pp.cur; if (!s || !pp.alive) return;
+                ctx.save();
+                if (pz) ctx.globalAlpha = 0.4;
+                else if (pp.imm) ctx.globalAlpha = (simulation.cycle % 6 < 3) ? 0.45 : 0.9;
+                else if (pp.fm === 7 && pp.fa) ctx.globalAlpha = 0.3;                                // cloaked: faint, not invisible       // same flicker n-gon shows during damage immunity
+                if (pp.fa && !pz && !(pp.vm && pp.vm.hasHold && now() - pp.vm.at < 250)) {                // field in use (fallback circle when no mirrored drawing)
+                    ctx.beginPath(); ctx.arc(s.x, s.y, Math.max(40, pp.fr || 120), 0, 2 * Math.PI);
+                    ctx.fillStyle = 'rgba(0,170,255,0.10)'; ctx.fill(); ctx.strokeStyle = 'rgba(0,170,255,0.35)'; ctx.lineWidth = 2; ctx.stroke();
+                }
+                if (hasSkinVm(pp)) { if (this._flash > 0) { ctx.beginPath(); ctx.arc(s.x, s.y, 32, 0, 2 * Math.PI); ctx.fillStyle = 'rgba(255,60,60,0.35)'; ctx.fill(); } }
+                else drawRemotePlayer(pp, s, this._flash > 0);
+                if (this._flash > 0) this._flash--;
+                const w = 60, hp = Math.max(0, Math.min(1, (pp.hp || 0) / Math.max(0.0001, pp.mhp || 1)));
+                ctx.fillStyle = 'rgba(100,100,100,0.4)'; ctx.fillRect(s.x - w / 2, s.y - 55, w, 6);
+                ctx.fillStyle = 'rgba(255,0,0,0.75)'; ctx.fillRect(s.x - w / 2, s.y - 55, w * hp, 6);
+                { const lbl = pp.name + (pz ? ' (paused)' : ''); ctx.font = 'bold 26px Arial'; ctx.textAlign = 'center'; ctx.lineJoin = 'round'; ctx.lineWidth = 6; ctx.strokeStyle = 'rgba(255,255,255,0.92)'; ctx.strokeText(lbl, s.x, s.y - 78); ctx.fillStyle = '#111'; ctx.fillText(lbl, s.x, s.y - 78); }
+                ctx.restore();
+                if (!pz) drawVm(pp);
+            });
+            ghosts.set(p.id, g); return g;
+        }
+        function removeGhost(id) {
+            const g = ghosts.get(id); if (!g) return;
+            ghosts.delete(id); removeBodyAndConstraints(g);
+            const i = mob.indexOf(g); if (i !== -1) mob.splice(i, 1);
+        }
+        function destroyGhosts() { for (const id of [...ghosts.keys()]) removeGhost(id); }
+        function maintainGhosts() {
+            for (const p of S.peers.values()) {
+                const want = S.inGame && !S.loading && !S.solo && p.buf.length && p.lc === LC() && !p.dead;   // a spectator has no body at all: no collisions, no effects, no ray blocking
+                if (want && !ghosts.has(p.id)) makeGhost(p);
+                else if (!want && ghosts.has(p.id)) removeGhost(p.id);
+            }
+        }
+        function drawPeerPolys(p, fr, fill) {
+            const a = p.bp; if (!a || !a.length) return;
+            let i = 0;
+            while (i + 5 <= a.length) {
+                const n = a[i + 4] | 0;
+                if (n < 3 || n > 24 || i + 5 + 2 * n > a.length) break;
+                const x = a[i] + a[i + 2] / 10 * fr, y = a[i + 1] + a[i + 3] / 10 * fr;
+                if (Number.isFinite(x) && Number.isFinite(y) && Math.abs(x) < 1e7 && Math.abs(y) < 1e7) {
+                    ctx.beginPath();
+                    for (let j = 0; j < n; j++) { const vx = a[i + 5 + 2 * j], vy = a[i + 6 + 2 * j]; if (Math.abs(vx) > 3000 || Math.abs(vy) > 3000) continue; if (j) ctx.lineTo(x + vx, y + vy); else ctx.moveTo(x + vx, y + vy); }
+                    ctx.closePath(); ctx.fillStyle = fill; ctx.fill();
+                }
+                i += 5 + 2 * n;
+            }
+        }
+        function drawPeerBullets(p) {
+            const a = p.bl;
+            if (!a || !a.length || now() - p.blAt > CFG.staleMs) { if (p.bp && now() - p.blAt <= CFG.staleMs) { const fr0 = Math.max(-9, Math.min(8, (now() - CFG.interpMs - (Number.isFinite(p.blT) ? p.blT : p.blAt)) / stepMs())); drawPeerPolys(p, fr0, (typeof color !== 'undefined' && color.bullet) || '#000'); } return; }
+            // ghosts are drawn interpMs in the past: put their bullets at the same moment (extrapolating backwards a few steps is fine for linear flight)
+            const fr = Math.max(-9, Math.min(8, (now() - CFG.interpMs - (Number.isFinite(p.blT) ? p.blT : p.blAt)) / stepMs()));
+            const fill = (typeof color !== 'undefined' && color.bullet) || '#000';
+            drawPeerPolys(p, fr, fill);
+            for (let i = 0; i + 7 < a.length; i += 8) {
+                const x = a[i] + a[i + 2] / 10 * fr, y = a[i + 1] + a[i + 3] / 10 * fr;
+                const w = a[i + 6], h = a[i + 7], kind = a[i + 4];
+                if (![x, y, w, h].every(Number.isFinite) || Math.abs(x) > 1e7 || Math.abs(y) > 1e7 || w <= 0 || w > 5000 || h < 0 || h > 5000) continue;
+                ctx.save(); ctx.fillStyle = fill; ctx.beginPath();
+                if (kind === 0) ctx.arc(x, y, Math.max(1.5, w), 0, 2 * Math.PI);
+                else if (kind === 1) { ctx.translate(x, y); ctx.rotate(a[i + 5] / 100); ctx.rect(-w / 2, -h / 2, w, h); }
+                else { ctx.restore(); continue; }
+                ctx.fill(); ctx.restore();
+            }
+        }
+        // smooth ghosts + puppet mobs right after each physics step
+        Matter.Events.on(engine, 'afterUpdate', guard('afterUpdate', () => {
+            const t = now() - CFG.interpMs;
+            for (const [pid, g] of ghosts) {
+                const p = S.peers.get(pid); if (!p || !p.buf.length) continue;
+                let s;
+                if (peerPaused(p)) {
+                    // paused (pause menu / upgrade screen): no extrapolation, and a player paused in mid-air falls to the floor instead of hovering
+                    const L = p.buf[p.buf.length - 1];
+                    if (p.fy === undefined) { p.fy = 0; p.fv = 0; }
+                    if (!p.og) {
+                        p.fv = Math.min(p.fv + 0.35, 25);
+                        let hit = false;
+                        try { hit = Matter.Query.ray(map, { x: L.x, y: L.y + p.fy }, { x: L.x, y: L.y + p.fy + 55 + p.fv }).length > 0; } catch (e) { hit = true; }
+                        if (hit) p.fv = 0; else p.fy += p.fv;
+                    }
+                    s = { x: L.x, y: L.y + p.fy, vx: 0, vy: 0, a: L.a };
+                } else {
+                    p.fy = undefined; p.fv = 0;
+                    s = sample(p.buf, t);
+                }
+                if (!s) continue; p.cur = s;
+                Body.setPosition(g, { x: s.x, y: s.y });
+            }
+            if (!S.isHost) for (const mo of mobMap.values()) {
+                if (!mo._buf || !mo._buf.length || !mo.alive) continue;
+                const s = sample(mo._buf, t); if (!s) continue;
+                Body.setPosition(mo, { x: s.x, y: s.y }); Body.setVelocity(mo, { x: s.vx, y: s.vy }); Body.setAngle(mo, s.a);
+            }
+        }));
+
+        // ------------------------------------------------------------------ sending
+        function fieldOn() { try { return !!(input.field && m.energy > 0.02 && !(m.fieldCDcycle > m.cycle)); } catch (e) { return false; } }
+        function localPlayer() {
+            const pos = m.pos || player.position, mi = simulation.mouseInGame || { x: 0, y: 0 };
+            const pz = S.paused;
+            return [q(pos.x), q(pos.y), pz ? 0 : q(player.velocity.x, 100), pz ? 0 : q(player.velocity.y, 100), q(m.angle, 1000), (m.alive && !S.dead) ? 1 : 0,
+            b.activeGun == null ? 255 : b.activeGun, m.fieldMode == null ? 255 : m.fieldMode, q(mi.x), q(mi.y),
+            q(m.health, 1000), q(m.maxHealth, 1000), S.pvp ? 1 : 0, m.onGround ? 1 : 0, q(m.yOff), pz ? 1 : 0, S.dead ? 1 : 0, fieldOn() ? 1 : 0, (m.immuneCycle > m.cycle && !S.dead) ? 1 : 0, q(Math.min(400, Number(m.fieldRange) || 0))];
+        }
+        function bulletSnap() {
+            const out = [], n = bullet.length; S.polyOut = [];
+            if (S.paused || S.dead) return out;
+            for (let i = Math.max(0, n - CFG.maxBullets); i < n; i++) {
+                const bl = bullet[i]; if (!bl || !bl.position) continue;
+                let kind = 0, w = 0, h = 0; const vt = bl.vertices;
+                if (Number.isFinite(bl.circleRadius) && bl.circleRadius > 0) w = bl.circleRadius;
+                else if (vt && vt.length === 4) {
+                    kind = 1;
+                    w = Math.hypot(vt[1].x - vt[0].x, vt[1].y - vt[0].y);
+                    h = Math.hypot(vt[2].x - vt[1].x, vt[2].y - vt[1].y);
+                } else if (vt && vt.length >= 3 && vt.length !== 4 && vt.length <= 24) {
+                    // polygons with more than four vertices (missiles, spores, balls...): send the REAL shape, relative to the centre
+                    const poly = [q(bl.position.x), q(bl.position.y), q(bl.velocity.x, 10), q(bl.velocity.y, 10), vt.length];
+                    for (const v of vt) poly.push(q(v.x - bl.position.x, 10) / 10, q(v.y - bl.position.y, 10) / 10);
+                    S.polyOut.push(...poly); continue;
+                } else if (bl.bounds) {
+                    kind = 1;
+                    w = bl.bounds.max.x - bl.bounds.min.x;
+                    h = bl.bounds.max.y - bl.bounds.min.y;
+                }
+                if (w < 0.5) continue;
+                out.push(q(bl.position.x), q(bl.position.y), q(bl.velocity.x, 10), q(bl.velocity.y, 10), kind, q(bl.angle, 100), q(w, 10) / 10, q(h, 10) / 10);
+            }
+            return out;
+        }
+        // keep every state packet small: drop the least important parts first and make sure dropped bodies / mobs are re-sent next tick
+        const jlen = v => { try { return JSON.stringify(v).length; } catch (e) { return 0; } };
+        function enforcePktBudget(pkt) {
+            const cap = CFG.maxPktBytes;
+            let total = jlen(pkt); if (total <= cap) return;
+            S.pktTrim = (S.pktTrim | 0) + 1;
+            const shrink = (key, minKeep, onDrop, stride) => {
+                stride = stride || 1;
+                const a = pkt[key]; if (!Array.isArray(a)) return;
+                while (total > cap && a.length > minKeep) {
+                    const keep = Math.max(minKeep, Math.floor(a.length / 2 / stride) * stride);
+                    const dropped = a.splice(keep);
+                    if (onDrop) for (const e of dropped) onDrop(e);
+                    total = jlen(pkt);
+                }
+                if (!a.length) delete pkt[key];
+            };
+            shrink('vm', 0);                                                                  // mirrored drawings are cosmetic
+            if (total > cap && pkt.bp) { delete pkt.bp; total = jlen(pkt); }                  // exact bullet polygons are cosmetic too
+            shrink('bl', 16, null, 8);                                                        // then far bullets (8 numbers each)
+            shrink('bk', 4, e => { const bd = bodyMap.get(e[0]); if (bd) { bd._mpLast = null; bd._rest = false; } });
+            shrink('mo', 8, e => { const mb = mobMap.get(e[0]); if (mb) mb._ls = null; });
+            shrink('mm', 0);
+        }
+        function sendState() {
+            const pkt = { t: 's', lc: LC(), ep: S.epoch, sq: ++S.sendSeq, ts: Math.round(now() * 10) / 10, p: localPlayer(), bl: bulletSnap() };
+            { const vms = VM.active ? vmSnap() : []; if (vms.length) pkt.vm = vms; }
+            if (S.polyOut && S.polyOut.length && S.polyOut.length < 2500) pkt.bp = S.polyOut;
+            const bk = [];
+            for (const bd of bodyMap.values()) {
+                // Include non-holdable shared doors and moving level machinery too.
+                if (S.isHost) { if (bd._owner !== null && bd._owner !== S.id) continue; }
+                else if (bd._owner !== S.id) continue;
+                const x = q(bd.position.x, 10), y = q(bd.position.y, 10), a = q(bd.angle, 1000);
+                const last = bd._mpLast;
+                const changed = !last || Math.abs(last[0] - x) > 1 || Math.abs(last[1] - y) > 1 || Math.abs(last[2] - a) > 2;
+                const mv = bd.speed > 0.15 || Math.abs(bd.angularSpeed) > 0.002 || bd === m.holdingTarget;
+                // Some n-gon doors/platforms are static Matter bodies moved with setPosition().
+                // Their Matter speed remains zero, so compare transforms rather than speed alone.
+                const periodic = S.isHost && S.tickN % 10 === 0;
+                if (changed || mv || !bd._rest || periodic) {
+                    bk.push([bd._nid, x, y, a, q(bd.velocity.x, 100), q(bd.velocity.y, 100), q(bd.angularVelocity, 1000)]);
+                    bd._mpLast = [x, y, a]; bd._rest = !mv && !changed;
+                }
+                if (bk.length >= 120) break;
+            }
+            if (bk.length) pkt.bk = bk;
+            if (S.isHost) {
+                pkt.cy = simulation.cycle; pkt.fi = simulation.fpsInterval;
+                const mm = scanMapMovers(); if (mm && mm.length) pkt.mm = mm;
+                const mo = [];
+                const nm = mob.length, start = nm ? (S.moRot | 0) % nm : 0; let stopAt = -1;
+                for (let ii = 0; ii < nm; ii++) {                                          // rotating start: when there are too many to fit, everyone still gets their turn
+                    const mb = mob[(start + ii) % nm];
+                    if (!mb || mb.isGhost || mb._nid === undefined || !mb.alive) continue;
+                    const x = q(mb.position.x), y = q(mb.position.y), hp = q(mb.health, 1000), l = mb._ls;
+                    if (!l || Math.abs(l[0] - x) + Math.abs(l[1] - y) > 1 || l[2] !== hp || S.tickN % 20 === 0) {
+                        mo.push([mb._nid, x, y, q(mb.velocity.x, 100), q(mb.velocity.y, 100), q(mb.angle, 1000), hp]); mb._ls = [x, y, hp];
+                    }
+                    if (mo.length >= 110) { stopAt = (start + ii + 1) % nm; break; }
+                }
+                S.moRot = stopAt >= 0 ? stopAt : 0;
+                if (mo.length) pkt.mo = mo;
+            }
+            enforcePktBudget(pkt);
+            sendSt(pkt);
+        }
+        function flush() {
+            const lc = LC();
+            const sendChunks = (t, list, n) => { for (let i = 0; i < list.length; i += n) sendEv({ t, lc, l: list.slice(i, i + n) }); };   // keep every reliable packet small
+            if (spawnQ.length) { sendChunks('sp', spawnQ, 60); spawnQ = []; }
+            if (deathQ.length) { sendChunks('md', deathQ, 200); deathQ = []; }
+            if (opsQ.length) { sendChunks('bk', opsQ, 60); opsQ = []; }
+            if (dropQ.length) { sendChunks('pd', dropQ, 100); dropQ = []; }
+            if (ownPuQ.length) { sendChunks('po', ownPuQ.slice(-30), 30); ownPuQ = []; }
+            if (dmgOut.size) {
+                const l = []; for (const [id, e] of dmgOut) l.push([id, e[0], e[1]]);
+                dmgOut.clear(); sendEv({ t: 'dm', lc, l, q: ++S.dmgSeq }, S.hostId);
+            }
+            if (pvpOut.size) { for (const [id, d] of pvpOut) sendEv({ t: 'pvp', lc, d, q: ++S.dmgSeq }, id); pvpOut.clear(); }
+            flushMobFx();
+            if (fxQ.length) { sendEv({ t: 'fx', lc, q: ++S.fxSeq, l: fxQ.slice(0, 12) }); fxQ = []; }
+        }
+        // am I paused? (pause menu, upgrade screen, hidden tab, or the game loop simply stopped advancing)
+        function updatePaused() {
+            const c = simulation.cycle;
+            S.stuck = (c === S.lastCycle) ? S.stuck + 1 : 0; S.lastCycle = c;
+            const was = S.paused;
+            S.paused = !!(S.inGame && (simulation.paused === true || document.hidden || S.stuck >= 4));
+            if (S.paused && !was) S.pausedAt = now();
+        }
+        // keep simulation.cycle close to the host's (cycle-driven moving platforms / timers)
+        function syncCycle() {
+            const h = S.hostCy;
+            if (!CFG.syncCycle || S.isHost || S.paused || !h || h.lc !== LC() || now() - h.t > 400 || simulation.clearNow) return;
+            if (!Number.isFinite(h.cy)) return;
+            if (h.fi != null && simulation.fpsInterval != null && Math.abs(Number(h.fi) - simulation.fpsInterval) > 1) return;   // different fps caps: cycles are not comparable
+            // simulation.cycle advances at the game's configured update cadence.
+            // Extrapolate using the host's actual frame interval rather than assuming 60 Hz.
+            const hostStep = Number.isFinite(Number(h.fi)) && Number(h.fi) > 0 ? Number(h.fi) :
+                (Number.isFinite(simulation.fpsInterval) && simulation.fpsInterval > 0 ? simulation.fpsInterval : 1000 / 60);
+            const exp = h.cy + (now() - h.t) / hostStep, diff = exp - simulation.cycle;
+            if (Math.abs(diff) > 30) simulation.cycle = Math.round(exp);
+            else if (Math.abs(diff) > 6) simulation.cycle += Math.sign(diff);
+        }
+        // Long sessions: drop bookkeeping for things the game has already removed, and delete physics bodies whose numbers went bad.
+        function pruneState() {
+            for (const [id, mo] of mobMap) if (!mo || !mo.alive || mob.indexOf(mo) === -1) mobMap.delete(id);
+            for (const [id, pu] of puMap) if (!pu || powerUp.indexOf(pu) === -1) puMap.delete(id);
+            for (const [id, bd] of bodyMap) if (!bd || bd._gone || (bd.position && !finiteBody(bd))) bodyMap.delete(id);
+            for (const [id, g] of ghosts) if (!S.peers.has(id)) removeGhost(id);                       // ghost whose peer is gone
+            for (const [id, g] of ghosts) if (!g.position || !Number.isFinite(g.position.x) || !Number.isFinite(g.position.y)) removeGhost(id);
+            for (const bd of body.slice()) {                                                           // invalid bodies would poison the physics step for everybody
+                if (bd && bd.position && !finiteBody(bd)) {
+                    try { Matter.Composite.remove(engine.world, bd); } catch (e) { }
+                    const i = body.indexOf(bd); if (i !== -1) body.splice(i, 1);
+                    errCount.badBody = (errCount.badBody | 0) + 1;
+                }
+            }
+            for (const p of S.peers.values()) if (p.buf && p.buf.length > 10) p.buf.splice(0, p.buf.length - 10);
+            for (const [k, v] of dmgOut) if (!v) dmgOut.delete(k);
+            if (dir.size > 200) { const keep = [...dir].slice(-200); dir.clear(); for (const [k, v] of keep) dir.set(k, v); }
+        }
+        function tick() {
+            S.tickN++;
+            try {
+                updatePaused();
+                if (S.expWait) expTryRelease();
+                levelWatch();
+                checkAllDown();
+                try { sweepStrays(); } catch (e) { }
+                if (!S.inGame || S.loading || S.solo) return;
+                wrapSpawns();
+                if (S.tickN % 4 === 0 && S.id && computeHost() !== S.hostId) refreshRole();   // hand the host role to / back from an active player
+                maintainGhosts(); checkMc(); runCatchup();
+                if (S.tickN % 150 === 0) pruneState();
+                if (!hasPeers()) { opsQ = []; dropQ = []; ownPuQ = []; spawnQ = []; deathQ = []; dmgOut.clear(); pvpOut.clear(); mfxQ = []; impOut.clear(); scanWorld(); return; }
+                syncCycle();
+                scanWorld(); flush(); sendState();
+                if (S.isHost && hasPeers() && !S.paused) {
+                    const t = now();
+                    if (t - S.lastRosterAt > 2000) { S.lastRosterAt = t; sendMobRoster(); }
+                    if (t - S.lastButtonSnapshotAt > 500) { S.lastButtonSnapshotAt = t; sendButtonSnapshot(); }
+                }
+            } catch (e) { const n = errCount.tick = (errCount.tick | 0) + 1; if (n <= 3) console.warn('[MP] tick', e); }
+        }
+        setInterval(tick, CFG.tickMs);
+
+        // ------------------------------------------------------------------ chat + UI
+        function say(text, isHtml) {
+            const msg = isHtml ? text : esc(text);
+            try { if (simulation.inGameConsole) simulation.inGameConsole(msg); else console.log('[MP]', text); } catch (e) { }
+        }
+        const ui = (function () {
+            const mk = (tag, txt, parent, cls) => {
+                const e = document.createElement(tag);
+                if (txt) e.textContent = txt;
+                if (cls) e.className = cls;
+                if (parent) parent.appendChild(e);
+                return e;
+            };
+            const css = document.createElement('style');
+            css.textContent = `
+#mp-panel{width:min(360px,calc(100vw - 24px));max-height:60vh;overflow:auto;box-sizing:border-box;font:14px/1.35 Arial,Helvetica,sans-serif;color:#f4f6f8;background:#1b2129;border:1px solid #556070;border-radius:8px;padding:10px 12px;text-shadow:none}
+
+
+
+#mp-panel button{background:#3a4658;color:#fff;border:1px solid #7a8aa0;border-radius:5px;padding:5px 9px;cursor:pointer;font-size:13px}
+#mp-notice{position:fixed;right:14px;top:54px;z-index:10001;width:min(340px,calc(100vw - 28px));padding:12px;background:rgba(24,29,37,.98);color:#fff;border:1px solid #647184;border-radius:10px;box-shadow:0 8px 28px rgba(0,0,0,.45);font:13px Arial,sans-serif}
+#mp-notice strong{display:block;margin-bottom:5px;font-size:14px}#mp-notice .actions{display:flex;gap:7px;margin-top:10px}#mp-notice button{flex:1;padding:7px;border-radius:6px;border:1px solid #68778b;background:#394657;color:white;cursor:pointer}#mp-notice button.primary{background:#287a58;border-color:#43a77b}
+#mp-panel *{box-sizing:border-box}
+#mp-panel h3{margin:0 0 6px;font-size:15px;display:flex;justify-content:space-between;align-items:center}
+#mp-panel .r{display:flex;gap:4px;align-items:center;margin:5px 0;flex-wrap:wrap}
+#mp-panel input[type=text]{flex:1;min-width:0;padding:5px 7px;font-size:14px;background:#0f141a;color:#fff;border:1px solid #6b7889;border-radius:5px}
+#mp-panel select{background:#0f141a;color:#fff;border:1px solid #6b7889;border-radius:5px;padding:3px 5px;font-size:14px}
+#mp-panel label{color:#f4f6f8;font-size:14px}
+#mp-panel .sec{margin-top:8px;padding-top:6px;border-top:1px solid rgba(255,255,255,.2);font-weight:bold;color:#fff}
+#mp-panel input:disabled,#mp-panel select:disabled{opacity:.55}
+#mp-panel button{cursor:pointer;padding:2px 8px}
+#mp-panel .pl{display:flex;align-items:center;gap:6px;padding:7px 2px;border-top:1px solid rgba(255,255,255,.13)}
+#mp-panel .pl .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:bold}
+#mp-panel .pl .sub{font-size:12px;color:#c4ccd7;font-weight:normal}
+#mp-panel .muted{color:#c4ccd7;font-size:13px}
+#mp-panel .dot{width:8px;height:8px;border-radius:50%;background:#3a3;flex:none}
+#multiplayer-details>summary{cursor:pointer;pointer-events:auto}
+@media(max-width:600px){#mp-panel{max-height:45vh}}
+`;
+            document.head.appendChild(css);
+
+            const details = document.getElementById('multiplayer-details');
+            if (!details) {
+                console.error('[MP] #multiplayer-details is missing from index.html');
+            }
+            const panel = document.createElement('div');
+            panel.id = 'mp-panel';
+            panel.className = 'details-div';
+            if (details) details.appendChild(panel);
+
+            const namebar = { style: {}, addEventListener() { } };   // the floating username box is gone (it covered the game); the name lives in the panel
+
+            const mkStop = e => e.stopPropagation();
+            const notice = document.createElement('div');
+            notice.id = 'mp-notice'; notice.style.display = 'none';
+            document.body.appendChild(notice);
+            for (const ev of ['keydown','keyup','keypress','mousedown','mouseup','pointerdown','pointerup','wheel','contextmenu','click','dblclick']) {
+                panel.addEventListener(ev, mkStop);
+                namebar.addEventListener(ev, mkStop);
+                notice.addEventListener(ev, mkStop);
+            }
+
+            const h = mk('h3', '', panel);
+            mk('span', 'Online players', h);
+            const nr = mk('div', '', panel, 'r');
+            mk('span', 'Your name', nr);
+            const topName = mk('input', '', nr);
+            topName.type = 'text'; topName.maxLength = 20; topName.value = S.baseName; topName.placeholder = 'username';
+            const me = mk('div', '', panel, 'muted');
+            const list = mk('div', '', panel);
+            mk('div', 'Room settings', panel, 'sec');
+            const rs = mk('div', '', panel, 'muted');
+            const r = mk('div', '', panel, 'r');
+            const t1 = mk('label', '', r);
+            const tcb = mk('input', '', t1); tcb.type = 'checkbox'; tcb.checked = S.together;
+            mk('span', ' stay together', t1);
+            const t2 = mk('label', '', r);
+            const pcb = mk('input', '', t2); pcb.type = 'checkbox'; pcb.checked = S.pvp;
+            mk('span', ' pvp (off by default)', t2);
+            const r2 = mk('div', '', panel, 'r');
+            const t3 = mk('label', '', r2);
+            const acb = mk('input', '', t3); acb.type = 'checkbox'; acb.checked = S.room.ask;
+            mk('span', ' ask me before players join', t3);
+            const t4 = mk('label', '', r2);
+            mk('span', 'max players ', t4);
+            const msel = mk('select', '', t4);
+            for (let n = 2; n <= 12; n++) { const o = mk('option', String(n), msel); o.value = String(n); }
+            msel.value = String(S.room.max);
+            const st = mk('div', 'Status: ...', panel, 'muted');
+            const roomEditable = () => S.isHost || !hasPeers();
+            const roomChanged = () => {
+                if (!roomEditable()) { syncRoom(); return; }
+                S.together = tcb.checked; S.pvp = pcb.checked; S.room.ask = acb.checked; S.room.max = Math.max(2, Math.min(12, +msel.value || 8));
+                sendRoom();
+                syncRoom();
+            };
+            tcb.onchange = pcb.onchange = acb.onchange = msel.onchange = roomChanged;
+            function syncRoom() {                                       // show the real values; only the host (or someone alone) can change them
+                tcb.checked = !!S.together; pcb.checked = !!S.pvp; acb.checked = !!S.room.ask; msel.value = String(S.room.max);
+                const ed = roomEditable();
+                tcb.disabled = pcb.disabled = acb.disabled = msel.disabled = !ed;
+                let info = ed ? 'You are the host: these settings apply to everyone.' : 'Set by the host - you cannot change them.';
+                try { info += ' Seed ' + getSeed() + ' - difficulty ' + (simulation.difficultyMode != null ? ['easy', 'normal', 'hard', 'why'][simulation.difficultyMode] || simulation.difficultyMode : '?') + (simulation.isCommunityMaps ? ' - community maps' : ''); } catch (e) { }
+                rs.textContent = info;
+            }
+
+            // the name applies by itself shortly after typing stops (no Set button)
+            let nameTimer = 0;
+            const applyName = () => {
+                clearTimeout(nameTimer);
+                const n = cleanName(topName.value);
+                if (!n || n === S.baseName) return;
+                try { localStorage.setItem('p2pUsername', n); } catch (e) {}
+                if (hasPeers()) { S.name = n; S.baseName = n; sendEv({ t: 'name', name: n }); refresh(); return; }   // connected: keep the connection, just rename
+                startPeer(n);
+            };
+            topName.addEventListener('input', () => { clearTimeout(nameTimer); nameTimer = setTimeout(applyName, 1200); });
+            topName.addEventListener('change', applyName);
+            topName.addEventListener('keydown', e => { if (e.key === 'Enter') applyName(); });
+
+            if (details) {
+                details.addEventListener('toggle', () => {
+                    try { localStorage.setItem('ngonmp_open', details.open ? '1' : '0'); } catch (e) {}
+                });
+                try { details.open = localStorage.getItem('ngonmp_open') === '1'; } catch (e) {}
+            }
+
+            const seed = seedEl();
+            if (seed) seed.addEventListener('input', () => { if (!S.inGame) sendEv({ t: 'seed', seed: getSeed() }); });
+
+            function refreshDir() {
+                const users = [...dir.values()].sort((a, b) => a.name.localeCompare(b.name));
+                const summary = details && details.querySelector('summary');
+                if (summary) summary.textContent = 'multiplayer (' + Math.max(users.length, S.id ? 1 : 0) + ' online)';
+                list.textContent = '';
+                if (!users.length) mk('div', S.id ? 'Looking for other players...' : 'Connecting to the network...', list, 'muted');
+                else if (S.id && !hub && !(hubConn && hubConn.open)) mk('div', 'Reconnecting to the player list...', list, 'muted');
+                for (const u of users) {
+                    const p = S.peers.get(u.id), conn = !!(p && p.ev && p.ev.open);
+                    const row = mk('div', '', list, 'pl');
+                    mk('span', '', row, 'dot').style.background = u.g ? '#3a3' : '#aaa';
+                    const nm = mk('span', '', row, 'nm');
+                    nm.textContent = u.name + (u.id === S.id ? ' (you)' : '');
+                    mk('div', u.g ? 'level ' + (u.lc + 1) : 'in menu', nm, 'sub').style.display = 'block';
+                    if (u.id === S.id) continue;
+                    if (conn) mk('span', 'connected', row, 'muted');
+                    else {
+                        const jb = mk('button', 'Request to join', row);
+                        jb.title = 'Ask this player for permission to join';
+                        jb.onclick = () => requestJoin(u.id);
+                        const ib = mk('button', 'Invite', row);
+                        ib.title = 'Invite this player to your session';
+                        ib.onclick = () => invitePlayer(u.id, u.name);
+                    }
+                }
+            }
+            function refresh() {
+                syncRoom();
+                const open = openPeers();
+                const people = S.id ? (open.length ? 'connected to ' + open.map(p => p.name).join(', ') + ' (' + (open.length + 1) + ' players, you are the ' + (S.isHost ? 'host' : 'client') + ')' : 'not connected to anyone yet') : 'connecting...';
+                st.textContent = 'Status: ' + people;
+                refreshDir();
+            }
+            const bannerEl = mk('div', '', document.body);
+            bannerEl.style.cssText = 'position:fixed;left:50%;top:14px;transform:translateX(-50%);z-index:10000;max-width:min(560px,92vw);padding:10px 16px;background:rgba(24,29,37,.92);color:#fff;border:1px solid #c0504d;border-radius:10px;font:14px Arial,sans-serif;text-align:center;display:none;pointer-events:none';
+            function banner(text) { if (text) { bannerEl.textContent = text; bannerEl.style.display = 'block'; } else bannerEl.style.display = 'none'; }
+            function notify(title, message, accept, decline) {
+                notice.textContent = '';
+                mk('strong', title, notice);
+                mk('div', message, notice);
+                const actions = mk('div', '', notice, 'actions');
+                const yes = mk('button', accept ? 'Accept' : 'OK', actions);
+                yes.className = 'primary';
+                yes.onclick = () => { notice.style.display = 'none'; if (accept) accept(); };
+                if (decline) {
+                    const no = mk('button', 'Decline', actions);
+                    no.onclick = () => { notice.style.display = 'none'; decline(); };
+                }
+                notice.style.display = 'block';
+            }
+            return {
+                setId(id) {
+                    me.textContent = 'Your session ID: ' + id;
+                    if (document.activeElement !== topName) topName.value = S.baseName;
+                },
+                status(s) { st.textContent = 'Status: ' + s; },
+                notify, banner, refresh, refreshDir
+            };
+        })();
+
+        // chat: Enter opens a box
+        (function () {
+            const inp = document.createElement('input'); inp.maxLength = 200; inp.placeholder = 'chat (Enter to send, Esc to cancel)';
+            inp.style.cssText = 'display:none;position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);width:min(70vw,800px);z-index:9999;padding:10px;font-size:16px;background:#e8e8e8cf;border:0;';
+            document.body.appendChild(inp);
+            let open = false;
+            const close = () => { open = false; inp.style.display = 'none'; inp.blur(); };
+            document.addEventListener('keydown', e => {
+                if (open) {
+                    e.stopPropagation();
+                    if (e.key === 'Enter') { const t = inp.value.trim(); if (t) { sendEv({ t: 'chat', x: t }); say(esc(S.name) + ': ' + esc(t), true); } close(); e.preventDefault(); }
+                    else if (e.key === 'Escape') { close(); e.preventDefault(); }
+                    return;
+                }
+                if (e.key === 'Enter') {
+                    const t = e.target; const typing = t && (t.tagName === 'TEXTAREA' || t.isContentEditable || (t.tagName === 'INPUT' && !['button', 'submit', 'checkbox', 'radio', 'range', 'color', 'file'].includes(t.type)));
+                    if (!typing && S.inGame) { e.preventDefault(); e.stopPropagation(); open = true; inp.value = ''; inp.style.display = 'block'; setTimeout(() => inp.focus(), 0); }
+                }
+            }, true);
+        })();
+
+        // ------------------------------------------------------------------ install
+        const gameRunning = () => typeof simulation.onTitlePage === 'boolean' ? !simulation.onTitlePage : (() => { const sp = document.getElementById('splash'); return sp ? getComputedStyle(sp).display === 'none' : false; })();
+        for (const key of ['spawnRandomPowerUp', 'spawnBossPowerUp', 'spawnTechPowerUps']) {
+            if (typeof powerUps[key] !== 'function') continue;
+            wrapFn(powerUps, key, 'powerUps.' + key, orig => function () {
+                S.dropCtx = (S.dropCtx | 0) + 1;
+                try { return orig.apply(this, arguments); } finally { S.dropCtx--; }
+            });
+        }
+        const recordDrop = guard('drop.record', (name, before) => {
+            if (!(S.dropCtx > 0) || !S.isHost || S.replayDrop || !hasPeers() || powerUp.length <= before) return;
+            const pu = powerUp[powerUp.length - 1];
+            if (pu && pu.position) dropQ.push([String(name), q(pu.position.x), q(pu.position.y), q(pu.size)]);
+        });
+        // Pickups made by a player's OWN code (techs, fields, healing overflow...) are shared too: every other client spawns its own copy.
+        const recordOwnSpawn = guard('po.record', (name, before) => {
+            if (powerUp.length <= before || S.dropCtx > 0 || S.replayDrop || S.netCtx > 0 || S.levelPhase > 0 || S.mobPhase > 0) return;
+            if (!S.inGame || S.loading || S.solo || S.applying || S.dead || !hasPeers() || ownPuQ.length > 60) return;
+            const pu = powerUp[powerUp.length - 1];
+            if (pu && pu.position) ownPuQ.push([String(name), q(pu.position.x), q(pu.position.y), q(pu.size)]);
+        });
+        wrapFn(powerUps, 'directSpawn', 'powerUps.directSpawn', orig => function (x, y, name) {
+            const before = powerUp.length;
+            const r = orig.apply(this, arguments);
+            recordDrop(name, before);
+            recordOwnSpawn(name, before);
+            return r;
+        });
+        wrapSpawns();
+        wrapFn(mobs, 'spawn', 'mobs.spawn.authority', orig => function () {
+            if (!S.isHost && !S.buildingLevel && !S.replay && !S.creatingGhost) return undefined;
+            return orig.apply(this, arguments);
+        });
+        wrapButtons();
+        wrapPopulateLevels();
+        wrapLevelFrameRandom();
+        wrapNewFeatures();
+        if (typeof powerUps !== 'undefined' && powerUps.difficulty) {
+            wrapFn(powerUps.difficulty, 'effect', 'powerUps.difficulty.effect', orig => function () {
+                if (S.inGame && !S.solo && hasPeers() && !S.isHost) {
+                    try { ui.banner('Only the host chooses the difficulty.'); setTimeout(() => ui.banner(null), 2500); } catch (e) { }
+                    return;
+                }
+                return orig.apply(this, arguments);
+            });
+            wrapFn(powerUps.difficulty, 'updateScale', 'difficulty.updateScale', orig => function () {
+                const r = orig.apply(this, arguments);
+                if (S.isHost && !S.solo && S.inGame && !S.diffApplying && hasPeers()) sendEv({ t: 'diff', o: cleanDiff(simulation.difficultyOptions) });
+                return r;
+            });
+        }
+        if (typeof build !== 'undefined' && build) {
+            wrapFn(build, 'reset', 'build.reset', orig => function () {
+                const r = orig.apply(this, arguments);
+                Promise.resolve(r).then(() => { if (S.inGame && !S.solo && hasPeers() && !S.expWait) { S.expSel = true; S.expReady = false; sendEv({ t: 'exp', st: 'sel' }); } }).catch(() => { });
+                return r;
+            });
+            wrapFn(build, 'startExperiment', 'build.startExperiment', orig => function () {
+                if (S.expWait) return undefined;
+                if (!S.expSel || S.solo || !S.inGame || !hasPeers() || S.applying) { if (S.expSel) { S.expSel = false; sendEv({ t: 'exp', st: 'go' }); } return orig.apply(this, arguments); }
+                S.expReady = true; sendEv({ t: 'exp', st: 'ready' });
+                const self = this, args = arguments;
+                S.expWait = () => orig.apply(self, args); S.expWaitAt = now();
+                expTryRelease();
+                return undefined;
+            });
+        } else HOOKS['build'] = false;
+        wrapDeath();
+        // explosions: n-gon draws them through simulation.drawList; copy exactly what an explosion drew so everybody sees it
+        if (typeof b !== 'undefined' && b && typeof b.explosion === 'function') {
+            wrapFn(b, 'explosion', 'b.explosion', orig => function () {
+                const list = simulation.drawList, n0 = list ? list.length : 0;
+                const r = orig.apply(this, arguments);
+                try {
+                    if (list && hasPeers() && S.isHost !== undefined && !S.solo && S.inGame && !S.loading) {
+                        for (let i = n0; i < list.length && i < n0 + 4; i++) {
+                            const e = list[i];
+                            if (e && Number.isFinite(e.x) && Number.isFinite(e.y) && Number.isFinite(e.radius) && typeof e.color === 'string') fxQ.push([q(e.x), q(e.y), q(e.radius), e.color]);
+                        }
+                        if (fxQ.length > 24) fxQ = fxQ.slice(-24);
+                    }
+                } catch (e) { }
+                return r;
+            });
+        } else HOOKS['b.explosion'] = false;
+
+        // Keep n-gon's native 72 Hz simulation speed regardless of the selected FPS cap.
+        // The original game advances one simulation cycle per rendered frame, so selecting
+        // 60/45/30 FPS also slows the simulation. This accumulator runs fixed 72 Hz updates
+        // and lets requestAnimationFrame render at whatever cadence the display supports.
+        (function installFixedRateSimulation() {
+            const FIXED_STEP_MS = 1000 / 72;
+            let lastFrameTime = null;
+            let accumulator = 0;
+
+            // Keep the public interval consistent for multiplayer cycle synchronization.
+            try {
+                Object.defineProperty(simulation, 'fpsInterval', {
+                    configurable: true,
+                    enumerable: true,
+                    get() { return FIXED_STEP_MS; },
+                    set(_value) { /* FPS preference no longer changes simulation speed. */ }
+                });
+            } catch (e) {
+                simulation.fpsInterval = FIXED_STEP_MS;
+            }
+
+            function fixedRateCycle(timestamp) {
+                if (simulation.paused) {
+                    lastFrameTime = null;
+                    accumulator = 0;
+                    return;
+                }
+
+                requestAnimationFrame(fixedRateCycle);
+
+                const frameTime = Number.isFinite(timestamp) ? timestamp : performance.now();
+
+                // Starting a new run resets the accumulator, then immediately performs
+                // the first cycle so the game's clearMap()/level.start() startup still runs.
+                if (simulation.clearNow) {
+                    lastFrameTime = frameTime;
+                    accumulator = FIXED_STEP_MS;
+                } else if (lastFrameTime === null) {
+                    lastFrameTime = frameTime;
+                    accumulator = 0;
+                    return;
+                } else {
+                    const elapsed = Math.max(0, Math.min(250, frameTime - lastFrameTime));
+                    lastFrameTime = frameTime;
+                    accumulator += elapsed;
+                }
+
+                // Catch up when the display/selected cap is below 72 Hz.
+                // The cap prevents a long background-tab pause from causing an unbounded loop.
+                let steps = 0;
+                while (accumulator + 0.001 >= FIXED_STEP_MS && steps < 18 && !simulation.paused) {
+                    accumulator -= FIXED_STEP_MS;
+                    steps++;
+
+                    simulation.cycle++;
+                    m.cycle++;
+                    if (input.fire || input.field) m.lastFireFieldCycle = m.cycle;
+
+                    try {
+                        if (simulation.clearNow) {
+                            simulation.clearNow = false;
+                            simulation.clearMap();
+                            level.start();
+                            consoleMirror.showTitleLogs();
+                        }
+                        if (simulation.extraCycles) simulation.timeSkip(simulation.extraCycles);
+                        simulation.loop();
+                    } catch (error) {
+                        consoleMirror.showError(error);
+                        consoleMirror.isShownByLoop = true;
+                        throw error;
+                    }
+                }
+            }
+
+            if (typeof window.cycle === 'function') {
+                window.cycle = fixedRateCycle;
+            } else {
+                console.warn('[MP] Could not replace the game cycle function; using a fixed 72 Hz interval as fallback.');
+                simulation.fpsInterval = FIXED_STEP_MS;
+            }
+            simulation.fpsInterval = FIXED_STEP_MS;
+        })();
+
+        if (gameRunning()) { S.inGame = true; S.runSeed = String(Math.initialSeed != null ? Math.initialSeed : getSeed()); guard('initial.load', afterLevelLoaded)(); }
+        setInterval(guard('detect', () => {
+            const run = gameRunning();
+            if (!S.inGame && !S.loading && run) { S.inGame = true; if (S.runSeed == null) S.runSeed = String(Math.initialSeed != null ? Math.initialSeed : getSeed()); afterLevelLoaded(); ui.refresh(); }
+            else if (S.inGame && !run && typeof simulation.onTitlePage === 'boolean') { S.inGame = false; S.loading = false; S.paused = false; if (S.solo) { S.solo = false; refreshRole(); } destroyGhosts(); resetSync(); ui.refresh(); }   // back on the title screen
+        }), 500);
+        installVisualMirror();
+        startPeer(S.baseName);
+        window.ngonMP = {
+            VM, S, peers: S.peers, dir, ghosts, mobMap, connect: connectTo, join: joinByName, rename: startPeer, hooks: HOOKS,
+            diag() {   // paste the output of ngonMP.diag() if something does not sync in your n-gon build
+                const g = n => { try { return (0, eval)('typeof ' + n); } catch (e) { return 'error'; } };
+                const o = {
+                    hooks: HOOKS,
+                    globals: { simulation: g('simulation'), level: g('level'), levelData: g('levelData'), levelEditor: g('levelEditor'), saveGame: g('saveGame'), map: g('map'), body: g('body'), mob: g('mob') },
+                    fns: { 'level.button': typeof level.button, 'level.nextLevel': typeof level.nextLevel, 'simulation.clearMap': typeof simulation.clearMap, 'simulation.startGame': typeof simulation.startGame },
+                    state: { id: S.id, host: S.hostId, isHost: S.isHost, inGame: S.inGame, solo: S.solo, level: LC(), onLevel: String(level.onLevel), runSeed: S.runSeed, mapBodies: S.mapIds ? S.mapIds.size : 0, buttons: S.buttons.length, peers: openPeers().map(p => p.name) }
+                };
+                console.log('[MP] diag', JSON.stringify(o, null, 1)); return o;
+            }
+        };
+        console.log('[MP] n-gon multiplayer v8 ready - use Multiplayer at the bottom-left to see players.');
+    }
+
+    whenReady(() => loadPeer(guard('init', init)));
+})();
