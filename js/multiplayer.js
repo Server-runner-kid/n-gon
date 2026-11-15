@@ -1,5 +1,5 @@
 /*
- * n-gon multiplayer v9-E  (v9-D + match management: host-authoritative level changes, reconnect/late-join parity, duplicate-connection fix, training isolation; combat sync: duplicate-damage guards, mirrored explosions, bullets on the ghost time base, field/immunity visuals; elimination + revival; ordered snapshots; world sync fixes; permission-based joins)
+ * n-gon multiplayer v10-A (visual mirror) / v9-E  (v9-D + match management: host-authoritative level changes, reconnect/late-join parity, duplicate-connection fix, training isolation; combat sync: duplicate-damage guards, mirrored explosions, bullets on the ghost time base, field/immunity visuals; elimination + revival; ordered snapshots; world sync fixes; permission-based joins)
  *
  * Design
  *  - Every client runs its OWN player, guns, techs and fields with the game's normal code.
@@ -597,7 +597,7 @@
 
         // ------------------------------------------------------------------ message handlers
         const H = {};
-        function onData(p, d) { if (!d || typeof d !== 'object') return; const f = H[d.t]; if (f) f(p, d); }
+        function onData(p, d) { if (!d || typeof d !== 'object') return; const f = H[d.t]; if (f) { S.netCtx = (S.netCtx | 0) + 1; try { f(p, d); } finally { S.netCtx--; } } }
         const onDataSafe = guard('net.data', onData);
 
         H.hello = (p, d) => {
@@ -873,7 +873,7 @@
             if (Number.isInteger(d.sq)) { if (d.sq <= p.lastSeq) return; p.lastSeq = d.sq; }
             const recv = now();
             // ---- level: when a peer changes level, everything we hold from its previous level is void
-            if (p.lc !== d.lc) { p.buf = []; p.bl = null; p.blAt = 0; p.cur = null; p.lastRecvT = 0; }
+            if (p.lc !== d.lc) { p.buf = []; p.bl = null; p.blAt = 0; p.cur = null; p.lastRecvT = 0; p.vm = null; }
             p.lc = d.lc; p.seenAt = recv;
             // ---- clock offset: place each sample at the SENDER's time so bursts (tab was throttled, network jitter) don't play back fast
             let st = recv;
@@ -897,6 +897,7 @@
             p.blT = st; p.bl = (d.lc === LC() && Array.isArray(d.bl)) ? d.bl.slice(0, CFG.maxBullets * 8).map(v => Number.isFinite(v) ? v : 0) : null;
             if (p.bl && p.bl.length % 8) p.bl.length -= p.bl.length % 8;
             p.blAt = now();
+            p.vm = (d.lc === LC() && !S.loading) ? vmParse(d.vm, st) : null;
             const fromHost = isHostPeer(p);
             if (d.cy != null && fromHost && !S.isHost && !p.paused) S.hostCy = { cy: Number(d.cy), t: now(), lc: p.lc, fi: d.fi };
             if (p.lc !== LC() || S.loading) return;
@@ -1769,6 +1770,249 @@
             }
         }
 
+        // ------------------------------------------------------------------ visual mirror (v10)
+        // Every weapon / field / tech effect in n-gon is drawn with plain canvas calls inside a handful of loop phases
+        // (b.fire, m.hold, each bullet.do, each ephemera.do). We record the canvas commands those phases issue for OUR player,
+        // send them as compact text, and replay them in world space on everybody else's screen. This covers every gun, field,
+        // bot, laser, drone, tech trail ... generically, with no per-item code, so new items "just work".
+        const VM = { cur: null, bad: false, active: false, frame: 0, sentFrame: 0, gid: 0, latest: new Map(), grads: 0, epArr: null, depthRec: 0 };
+        const vmNum = (v, d) => { const n = Number(v); return Number.isFinite(n) ? String(+n.toFixed(d)) : '0'; };
+        const vmCol = c => '~' + String(c).replace(/[;,]/g, m => m === ',' ? '|' : '').slice(0, 60);
+        const VM_COLOR = /^(rgba?\([0-9., %\-]+\)|hsla?\([0-9., %\-]+\)|#[0-9a-fA-F]{3,8}|[a-zA-Z]{3,24})$/;
+        const VM_COMP = new Set(['source-over', 'lighter', 'multiply', 'screen', 'overlay', 'destination-out', 'source-atop', 'xor', 'difference', 'darken', 'lighten']);
+        const VM_CAP = new Set(['butt', 'round', 'square']), VM_JOIN = new Set(['miter', 'round', 'bevel']);
+        const VM_ARGS = { B: 0, Z: 0, M: 2, L: 2, A: 6, E: 8, Q: 4, C: 6, R: 4, T: 5, F: 0, S: 0, P: 4, O: 4, V: 0, W: 0, X: 2, Y: 1, D: 2, U: 6, K: 0, a: 1, e: 1, h: 1, J: 1, l: 1 };
+        function vmRec(code, args, prec) {
+            const c = VM.cur; if (!c || c.ops.length > 5000) return;
+            let s = code; if (args) { for (let i = 0; i < args.length; i++) s += (i ? ',' : '') + (typeof args[i] === 'string' ? args[i] : vmNum(args[i], prec == null ? 1 : prec)); }
+            c.ops.push(s);
+        }
+        function installRecorder() {
+            if (ctx._mpRec) return; ctx._mpRec = true;
+            const proto = Object.getPrototypeOf(ctx);
+            const meth = (name, code, prec, fix) => {
+                const orig = ctx[name]; if (typeof orig !== 'function') return;
+                ctx[name] = function () {
+                    if (VM.cur) { try { vmRec(code, fix ? fix(arguments) : arguments, prec); } catch (e) { } }
+                    return orig.apply(ctx, arguments);
+                };
+            };
+            meth('beginPath', 'B'); meth('closePath', 'Z'); meth('moveTo', 'M'); meth('lineTo', 'L');
+            meth('arc', 'A', 3, a => [a[0], a[1], a[2], a[3], a[4], a[5] ? 1 : 0]);
+            meth('ellipse', 'E', 3, a => [a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7] ? 1 : 0]);
+            meth('quadraticCurveTo', 'Q'); meth('bezierCurveTo', 'C'); meth('rect', 'R'); meth('arcTo', 'T');
+            meth('fill', 'F', 1, () => []); meth('stroke', 'S'); meth('fillRect', 'P'); meth('strokeRect', 'O');
+            meth('save', 'V'); meth('restore', 'W'); meth('translate', 'X'); meth('rotate', 'Y', 4); meth('scale', 'D', 4); meth('transform', 'U', 4);
+            meth('clip', 'K', 1, () => []);
+            meth('setLineDash', 'I', 1, a => (Array.isArray(a[0]) ? a[0].slice(0, 6) : []));
+            meth('fillText', 't', 1, a => [encodeURIComponent(String(a[0]).slice(0, 40)), a[1], a[2]]);
+            for (const n of ['setTransform', 'resetTransform', 'reset', 'drawImage', 'putImageData', 'createPattern']) {
+                const orig = ctx[n]; if (typeof orig !== 'function') continue;
+                ctx[n] = function () { if (VM.cur && n !== 'createPattern') VM.bad = true; return orig.apply(ctx, arguments); };
+            }
+            const mkGrad = (name, code) => {
+                const orig = ctx[name]; if (typeof orig !== 'function') return;
+                ctx[name] = function () {
+                    const g = orig.apply(ctx, arguments);
+                    if (VM.cur && g) {
+                        g._vid = ++VM.grads; vmRec(code, [g._vid, ...arguments], 1);
+                        const add = g.addColorStop; g.addColorStop = function (o, col) { if (VM.cur) vmRec('s', [g._vid, vmNum(o, 3), vmCol(col)]); return add.call(g, o, col); };
+                    }
+                    return g;
+                };
+            };
+            mkGrad('createLinearGradient', 'q'); mkGrad('createRadialGradient', 'r');
+            const prop = (name, code, kind) => {
+                const d = Object.getOwnPropertyDescriptor(proto, name); if (!d || !d.set) return;
+                Object.defineProperty(ctx, name, {
+                    configurable: true, enumerable: true,
+                    get() { return d.get.call(ctx); },
+                    set(v) {
+                        if (VM.cur) {
+                            if (kind === 'col') { if (typeof v === 'string') vmRec(code, [vmCol(v)]); else if (v && v._vid) vmRec(code, ['@' + v._vid]); }
+                            else if (kind === 'str') vmRec(code, [String(v).replace(/[;,]/g, '')]);
+                            else vmRec(code, [v], 3);
+                        }
+                        d.set.call(ctx, v);
+                    }
+                });
+            };
+            prop('globalAlpha', 'a', 'num'); prop('fillStyle', 'c', 'col'); prop('strokeStyle', 'd', 'col'); prop('lineWidth', 'e', 'num');
+            prop('lineCap', 'f', 'str'); prop('lineJoin', 'g', 'str'); prop('miterLimit', 'h', 'num'); prop('globalCompositeOperation', 'i', 'str');
+            prop('lineDashOffset', 'J', 'num'); prop('font', 'k', 'str'); prop('shadowBlur', 'l', 'num'); prop('shadowColor', 'm', 'col'); prop('textAlign', 'n', 'str');
+        }
+        function vmBegin(kind, key, ax, ay, vx, vy) {
+            if (VM.cur) return false;
+            VM.cur = { kind, key, ax: ax || 0, ay: ay || 0, vx: vx || 0, vy: vy || 0, ops: [] }; VM.bad = false; return true;
+        }
+        function vmEnd() {
+            const c = VM.cur; VM.cur = null; if (!c) return;
+            if (c.ops.length && !VM.bad) VM.latest.set(c.key, { k: c.kind, ax: c.ax, ay: c.ay, vx: c.vx, vy: c.vy, s: c.ops.join(';'), f: VM.frame });
+        }
+        function vmPhase(obj, key, gkey, kind) {
+            if (!obj || typeof obj[key] !== 'function') { HOOKS['vm.' + gkey] = false; return; }
+            let raw = obj[key];
+            const wrapper = function () {
+                if (!VM.active || VM.cur) return raw.apply(this, arguments);
+                const p = m.pos || player.position;
+                vmBegin(kind, gkey, p.x, p.y, 0, 0);
+                try { return raw.apply(this, arguments); } finally { vmEnd(); }
+            };
+            Object.defineProperty(obj, key, { configurable: true, enumerable: true, get() { return wrapper; }, set(f) { raw = f; } });
+            HOOKS['vm.' + gkey] = true;
+        }
+        function installPhases() {
+            vmPhase(m, 'hold', 'hold', 0);
+            vmPhase(b, 'fire', 'fire', 0);
+            // per-bullet groups (own velocity => smooth extrapolation on the other screens)
+            const rawBD = b.bulletDo;
+            if (typeof rawBD === 'function' && /bullet\[i\]\.do\(\)/.test(Function.prototype.toString.call(rawBD))) {
+                let raw = rawBD;
+                const wrapper = function () {
+                    if (!VM.active || VM.cur) return raw.apply(this, arguments);
+                    for (let i = 0, len = bullet.length; i < len; i++) {
+                        const bl = bullet[i]; if (!bl) continue;
+                        if (!bl._vid) bl._vid = ++VM.gid;
+                        const v = bl.velocity || { x: 0, y: 0 }, pos = bl.position || { x: 0, y: 0 };
+                        vmBegin(1, 'b' + bl._vid, pos.x, pos.y, v.x, v.y);
+                        try { bl.do(); } finally { vmEnd(); }
+                    }
+                };
+                Object.defineProperty(b, 'bulletDo', { configurable: true, enumerable: true, get() { return wrapper; }, set(f) { raw = f; } });
+                HOOKS['vm.bulletDo'] = true;
+            } else HOOKS['vm.bulletDo'] = false;
+            // ephemera created by OUR player's code (not by the level, mobs or network handlers) are mirrored too
+            const rawEph = simulation.runEphemera;
+            if (typeof rawEph === 'function' && /ephemera\[i\]/.test(Function.prototype.toString.call(rawEph))) {
+                let raw = rawEph;
+                const tagArr = () => {
+                    const arr = simulation.ephemera;
+                    if (!Array.isArray(arr) || VM.epArr === arr) return;
+                    VM.epArr = arr; const push = Array.prototype.push;
+                    arr.push = function () { if (!(S.levelPhase > 0 || S.mobPhase > 0 || S.netCtx > 0)) for (let i = 0; i < arguments.length; i++) { const x = arguments[i]; if (x && typeof x === 'object') x._own = 1; } return push.apply(this, arguments); };
+                };
+                const wrapper = function () {
+                    tagArr();
+                    if (!VM.active || VM.cur) return raw.apply(this, arguments);
+                    for (let i = simulation.ephemera.length - 1; i >= 0; i--) {
+                        const e = simulation.ephemera[i]; if (!e) continue;
+                        if (e._own) {
+                            if (!e._vid) e._vid = ++VM.gid;
+                            vmBegin(2, 'e' + e._vid, 0, 0, 0, 0);
+                            try { e.do(); } finally { vmEnd(); }
+                        } else e.do();
+                    }
+                };
+                Object.defineProperty(simulation, 'runEphemera', { configurable: true, enumerable: true, get() { return wrapper; }, set(f) { raw = f; } });
+                HOOKS['vm.ephemera'] = true;
+            } else HOOKS['vm.ephemera'] = false;
+            wrapFn(mobs, 'loop', 'vm.mobs.loop', orig => function () { S.mobPhase = (S.mobPhase | 0) + 1; try { return orig.apply(this, arguments); } finally { S.mobPhase--; } });
+            wrapFn(level, 'start', 'vm.level.start', orig => function () { S.levelPhase = (S.levelPhase | 0) + 1; try { return orig.apply(this, arguments); } finally { S.levelPhase--; } });
+        }
+        function installVisualMirror() {
+            try { installRecorder(); installPhases(); } catch (e) { console.warn('[MP] visual mirror failed to install', e); }
+            Matter.Events.on(engine, 'afterUpdate', () => {
+                VM.frame++;
+                VM.active = !!(S.inGame && !S.loading && !S.solo && !S.paused && !S.dead && hasPeers());
+            });
+        }
+        // serialise what was drawn since the last packet (kind 0 first: field / gun, then bullets, then ephemera)
+        function vmSnap() {
+            const out = []; let size = 0;
+            const items = [...VM.latest.entries()].filter(([k, g]) => g.f >= VM.sentFrame).sort((a, b2) => a[1].k - b2[1].k);
+            for (const [k, g] of items) {
+                if (size + g.s.length > 9000) break;
+                size += g.s.length + 40;
+                out.push([g.k, k, q(g.ax, 10) / 10, q(g.ay, 10) / 10, q(g.vx, 100) / 100, q(g.vy, 100) / 100, g.s]);
+            }
+            VM.sentFrame = VM.frame + 1;
+            for (const [k, g] of VM.latest) if (g.f < VM.frame - 40) VM.latest.delete(k);
+            return out;
+        }
+        function vmParse(list, st) {
+            if (!Array.isArray(list)) return null;
+            const groups = []; let total = 0, hasHold = false;
+            for (const e of list.slice(0, 160)) {
+                if (!Array.isArray(e) || e.length < 7 || typeof e[6] !== 'string' || e[6].length > 6000) continue;
+                const kind = e[0] | 0, ax = Number(e[2]), ay = Number(e[3]), vx = Number(e[4]), vy = Number(e[5]);
+                if (![ax, ay, vx, vy].every(Number.isFinite) || Math.abs(vx) > 500 || Math.abs(vy) > 500) continue;
+                const ops = [];
+                for (const part of e[6].split(';')) {
+                    if (!part) continue;
+                    const code = part[0], a = part.length > 1 ? part.slice(1).split(',') : [];
+                    let op = null;
+                    if (code in VM_ARGS) {
+                        if (a.length !== VM_ARGS[code]) continue;
+                        const n = a.map(Number); if (!n.every(Number.isFinite) || n.some(v => Math.abs(v) > 1e7)) continue;
+                        if (code === 'A' && n[2] > 20000) continue; if (code === 'D' && (Math.abs(n[0]) > 100 || Math.abs(n[1]) > 100)) continue;
+                        op = [code, ...n];
+                    } else if (code === 'I') { const n = a.map(Number).filter(Number.isFinite).slice(0, 6); op = ['I', n]; }
+                    else if (code === 'c' || code === 'd' || code === 'm') {
+                        const v = a[0] || ''; if (v[0] === '@' && code !== 'm') op = [code, v]; else if (v[0] === '~') { const col = v.slice(1).replace(/\|/g, ','); if (VM_COLOR.test(col)) op = [code, col]; }
+                    } else if (code === 'q' && a.length === 5) { const n = a.map(Number); if (n.every(Number.isFinite)) op = ['q', ...n]; }
+                    else if (code === 'r' && a.length === 7) { const n = a.map(Number); if (n.every(Number.isFinite)) op = ['r', ...n]; }
+                    else if (code === 's' && a.length === 3) { const col = (a[2] || '').slice(1).replace(/\|/g, ','); const n0 = Number(a[0]), n1 = Number(a[1]); if (a[2] && a[2][0] === '~' && VM_COLOR.test(col) && Number.isFinite(n0) && n1 >= 0 && n1 <= 1) op = ['s', n0, n1, col]; }
+                    else if (code === 'f') { if (VM_CAP.has(a[0])) op = ['f', a[0]]; }
+                    else if (code === 'g') { if (VM_JOIN.has(a[0])) op = ['g', a[0]]; }
+                    else if (code === 'i') { if (VM_COMP.has(a[0])) op = ['i', a[0]]; }
+                    else if (code === 'k') { if (/^[0-9a-z .'"\-]{1,40}$/i.test(a[0] || '')) op = ['k', a[0]]; }
+                    else if (code === 'n') { if (['left', 'right', 'center', 'start', 'end'].includes(a[0])) op = ['n', a[0]]; }
+                    else if (code === 't' && a.length === 3) { const x = Number(a[1]), y = Number(a[2]); if (Number.isFinite(x) && Number.isFinite(y)) { let tx = ''; try { tx = decodeURIComponent(a[0]).slice(0, 40); } catch (er) { } op = ['t', tx, x, y]; } }
+                    if (op) ops.push(op);
+                }
+                total += ops.length; if (total > 8000) break;
+                if (ops.length) { groups.push({ k: kind, ax, ay, vx, vy, ops }); if (kind === 0) hasHold = true; }
+            }
+            return { g: groups, t: st, at: now(), hasHold };
+        }
+        function vmRun(ops) {
+            let depth = 0; const grads = new Map();
+            const style = (v) => (v[0] === '@' ? (grads.get(Number(v.slice(1))) || 'rgba(0,0,0,0)') : v);
+            for (const o of ops) {
+                const c = o[0];
+                switch (c) {
+                    case 'B': ctx.beginPath(); break; case 'Z': ctx.closePath(); break;
+                    case 'M': ctx.moveTo(o[1], o[2]); break; case 'L': ctx.lineTo(o[1], o[2]); break;
+                    case 'A': ctx.arc(o[1], o[2], Math.max(0, o[3]), o[4], o[5], !!o[6]); break;
+                    case 'E': ctx.ellipse(o[1], o[2], Math.max(0, o[3]), Math.max(0, o[4]), o[5], o[6], o[7], !!o[8]); break;
+                    case 'Q': ctx.quadraticCurveTo(o[1], o[2], o[3], o[4]); break;
+                    case 'C': ctx.bezierCurveTo(o[1], o[2], o[3], o[4], o[5], o[6]); break;
+                    case 'R': ctx.rect(o[1], o[2], o[3], o[4]); break; case 'T': ctx.arcTo(o[1], o[2], o[3], o[4], Math.max(0, o[5])); break;
+                    case 'F': ctx.fill(); break; case 'S': ctx.stroke(); break; case 'K': ctx.clip(); break;
+                    case 'P': ctx.fillRect(o[1], o[2], o[3], o[4]); break; case 'O': ctx.strokeRect(o[1], o[2], o[3], o[4]); break;
+                    case 'V': if (depth < 24) { ctx.save(); depth++; } break; case 'W': if (depth > 0) { ctx.restore(); depth--; } break;
+                    case 'X': ctx.translate(o[1], o[2]); break; case 'Y': ctx.rotate(o[1]); break; case 'D': ctx.scale(o[1], o[2]); break; case 'U': ctx.transform(o[1], o[2], o[3], o[4], o[5], o[6]); break;
+                    case 'I': ctx.setLineDash(o[1]); break;
+                    case 'a': ctx.globalAlpha = Math.max(0, Math.min(1, o[1])); break; case 'e': ctx.lineWidth = Math.max(0, Math.min(500, o[1])); break;
+                    case 'h': ctx.miterLimit = Math.max(1, Math.min(100, o[1])); break; case 'J': ctx.lineDashOffset = o[1]; break; case 'l': ctx.shadowBlur = Math.max(0, Math.min(200, o[1])); break;
+                    case 'c': ctx.fillStyle = style(o[1]); break; case 'd': ctx.strokeStyle = style(o[1]); break; case 'm': ctx.shadowColor = o[1]; break;
+                    case 'f': ctx.lineCap = o[1]; break; case 'g': ctx.lineJoin = o[1]; break; case 'i': ctx.globalCompositeOperation = o[1]; break;
+                    case 'k': ctx.font = o[1]; break; case 'n': ctx.textAlign = o[1]; break;
+                    case 't': ctx.fillText(o[1], o[2], o[3]); break;
+                    case 'q': grads.set(o[1], ctx.createLinearGradient(o[2], o[3], o[4], o[5])); break;
+                    case 'r': grads.set(o[1], ctx.createRadialGradient(o[2], o[3], Math.max(0, o[4]), o[5], o[6], Math.max(0, o[7]))); break;
+                    case 's': { const g = grads.get(o[1]); if (g) { try { g.addColorStop(o[2], o[3]); } catch (e) { } } break; }
+                }
+            }
+            while (depth-- > 0) ctx.restore();
+        }
+        function drawVm(p) {
+            const vm = p.vm; if (!vm || !vm.g.length || now() - vm.at > 250 || VM.cur) return;
+            const cur = p.cur;
+            const fr = Math.max(-9, Math.min(8, (now() - CFG.interpMs - (Number.isFinite(vm.t) ? vm.t : vm.at)) / stepMs()));
+            for (const g of vm.g) {
+                let dx = 0, dy = 0;
+                if (g.k === 0) { if (!cur) continue; dx = cur.x - g.ax; dy = cur.y - g.ay; }
+                else if (g.k === 1) { dx = g.vx * fr; dy = g.vy * fr; }
+                ctx.save();
+                try {
+                    ctx.globalAlpha = 1; ctx.globalCompositeOperation = 'source-over'; ctx.lineWidth = 1; ctx.lineCap = 'butt'; ctx.lineJoin = 'miter'; ctx.setLineDash([]); ctx.shadowBlur = 0;
+                    ctx.translate(dx, dy); vmRun(g.ops);
+                } catch (e) { errCount.vm = (errCount.vm | 0) + 1; }
+                ctx.restore();
+            }
+        }
+
         // ------------------------------------------------------------------ ghosts (other players)
         function drawRemotePlayer(p, s, flash) {
             const L1 = (m && m.legLength1) || 55, L2 = (m && m.legLength2) || 45, HT = (m && m.height) || 42;
@@ -1836,7 +2080,7 @@
                 ctx.save();
                 if (pz) ctx.globalAlpha = 0.4;
                 else if (pp.imm) ctx.globalAlpha = (simulation.cycle % 6 < 3) ? 0.45 : 0.9;       // same flicker n-gon shows during damage immunity
-                if (pp.fa && !pz) {                                                                // field in use
+                if (pp.fa && !pz && !(pp.vm && pp.vm.hasHold && now() - pp.vm.at < 250)) {                // field in use (fallback circle when no mirrored drawing)
                     ctx.beginPath(); ctx.arc(s.x, s.y, Math.max(40, pp.fr || 120), 0, 2 * Math.PI);
                     ctx.fillStyle = 'rgba(0,170,255,0.10)'; ctx.fill(); ctx.strokeStyle = 'rgba(0,170,255,0.35)'; ctx.lineWidth = 2; ctx.stroke();
                 }
@@ -1847,6 +2091,7 @@
                 ctx.fillStyle = 'rgba(255,0,0,0.75)'; ctx.fillRect(s.x - w / 2, s.y - 55, w * hp, 6);
                 ctx.fillStyle = '#000'; ctx.font = '24px Arial'; ctx.textAlign = 'center'; ctx.fillText(pp.name + (pz ? ' (paused)' : ''), s.x, s.y - 65);
                 ctx.restore();
+                if (!pz) drawVm(pp);
             });
             ghosts.set(p.id, g); return g;
         }
@@ -1945,6 +2190,7 @@
         }
         function sendState() {
             const pkt = { t: 's', lc: LC(), ep: S.epoch, sq: ++S.sendSeq, ts: Math.round(now() * 10) / 10, p: localPlayer(), bl: bulletSnap() };
+            { const vms = VM.active ? vmSnap() : []; if (vms.length) pkt.vm = vms; }
             const bk = [];
             for (const bd of bodyMap.values()) {
                 // Include non-holdable shared doors and moving level machinery too.
@@ -2355,6 +2601,7 @@
             if (!S.inGame && !S.loading && run) { S.inGame = true; if (S.runSeed == null) S.runSeed = String(Math.initialSeed != null ? Math.initialSeed : getSeed()); afterLevelLoaded(); ui.refresh(); }
             else if (S.inGame && !run && typeof simulation.onTitlePage === 'boolean') { S.inGame = false; S.loading = false; S.paused = false; if (S.solo) { S.solo = false; refreshRole(); } destroyGhosts(); resetSync(); ui.refresh(); }   // back on the title screen
         }), 500);
+        installVisualMirror();
         startPeer(S.baseName);
         window.ngonMP = {
             S, peers: S.peers, dir, ghosts, mobMap, connect: connectTo, join: joinByName, rename: startPeer, hooks: HOOKS,
