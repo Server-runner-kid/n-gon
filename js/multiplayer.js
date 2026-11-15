@@ -1,5 +1,5 @@
 /*
- * n-gon multiplayer v10-F (flash frames, shared self-spawned pickups, experimental ready gate, 9 KB packet budget, hashed mob roster; spectators removed from the world, real skins mirrored, no duplicate mob-death visuals, touch-to-claim blocks; F stability: packet validation/rate limits/chunking, pruning, invalid-body cleanup; visual mirror, guest mob effects, printed flag, real bullet shapes, cloak fix, spectators non-solid, pilot wave claim, shared experimental mode) / v9-E  (v9-D + match management: host-authoritative level changes, reconnect/late-join parity, duplicate-connection fix, training isolation; combat sync: duplicate-damage guards, mirrored explosions, bullets on the ghost time base, field/immunity visuals; elimination + revival; ordered snapshots; world sync fixes; permission-based joins)
+ * n-gon multiplayer v10-J (cloak flash, blend modes, host-authoritative difficulty, guest experiment scroll; spectator camera, gravity-flip buttons, host room settings, panel UI; triangle bullets sent as real polygons; flash frames, shared self-spawned pickups, experimental ready gate, 9 KB packet budget, hashed mob roster; spectators removed from the world, real skins mirrored, no duplicate mob-death visuals, touch-to-claim blocks; F stability: packet validation/rate limits/chunking, pruning, invalid-body cleanup; visual mirror, guest mob effects, printed flag, real bullet shapes, cloak fix, spectators non-solid, pilot wave claim, shared experimental mode) / v9-E  (v9-D + match management: host-authoritative level changes, reconnect/late-join parity, duplicate-connection fix, training isolation; combat sync: duplicate-damage guards, mirrored explosions, bullets on the ghost time base, field/immunity visuals; elimination + revival; ordered snapshots; world sync fixes; permission-based joins)
  *
  * Design
  *  - Every client runs its OWN player, guns, techs and fields with the game's normal code.
@@ -140,7 +140,7 @@
             id: null, hostId: null, sessionHostId: null, isHost: true,
             name: localStorage.getItem('p2pUsername') || 'player',
             peers: new Map(),
-            together: true, pvp: true,
+            together: true, pvp: false, room: { max: 8, ask: true },
             forceLocalNext: false, hostAction: false, lvlReqLc: -1, lvlReqAt: 0,
             inGame: false, loading: false, applying: false, replay: false, inPuppet: false,
             replayNew: [], grp: 0, ctr: 0, tickN: 0,
@@ -149,7 +149,7 @@
             runSeed: null, remotePending: false,
             paused: false, pausedAt: 0, stuck: 0, lastCycle: -1, hostCy: null,
             dmgSeq: 0, fxSeq: 0, mfxSeq: 0, epoch: (crypto.getRandomValues(new Uint32Array(1))[0]).toString(36), sendSeq: 0, dead: false, deadLc: -1, deadAt: 0, revivedLc: -1, revAuth: -1, forceDeath: false, reviveTimer: null,
-            buttons: [], buttonSeq: 0, buttonSent: new Map(), remoteButtons: new Map(),
+            buttons: Object.create(null), buttonSeq: 0, buttonSent: new Map(), remoteButtons: new Map(),
             buildingLevel: false, lastRosterAt: 0, lastButtonSnapshotAt: 0,
             solo: false, savePending: false, saveStarted: false, saveWatching: false, olWarned: -1, forceLv: null, forceFlip: null, forceDf: null,
             mapIds: null, mapSent: new Map(), mapBase: new Map(),
@@ -333,6 +333,8 @@
                 const who = cleanName(d.name) || 'A player';
                 if (d.t === 'join-request' || d.t === 'invite') {
                     const isInvite = d.t === 'invite';
+                    if (!isInvite && openPeers().length + 1 >= S.room.max) { try { c.send({ t: 'control-result', ok: false, reason: 'The room is full.' }); } catch (e) { } return; }
+                    if (!isInvite && !S.room.ask && (S.isHost || !hasPeers())) { approvedPeers.add(from); try { c.send({ t: 'control-result', ok: true }); } catch (e) { } return; }
                     ui.notify(isInvite ? 'Multiplayer invitation' : 'Join request',
                         who + (isInvite ? ' invited you to play.' : ' wants to join your session.'),
                         () => {
@@ -362,9 +364,10 @@
 
         // ------------------------------------------------------------------ online directory (lobby)
         const dir = new Map();          // id -> {id,name,g,lc,n}
-        let hub = null, hubConn = null, hubTimer = null, hubStarting = false, lastReg = '', lastRegAt = 0;
+        let hub = null, hubConn = null, hubTimer = null, hubStarting = false, lastReg = '', lastRegAt = 0, lastDirAt = 0, lastLobbyTry = 0;
         const myInfo = () => ({ id: S.id, name: S.name, g: S.inGame ? 1 : 0, lc: LC(), n: openPeers().length });
         function setDir(list) {
+            lastDirAt = now();
             dir.clear();
             for (const e of list || []) {
                 if (!Array.isArray(e) || !validId(e[0])) continue;
@@ -375,7 +378,7 @@
         function connectLobby() {
             if (!peer || !S.id || hub) return;
             if (hubConn && hubConn.open) return;
-            const gen = peerGen;
+            const gen = peerGen; lastLobbyTry = now();
             let c;
             try { c = peer.connect(LOBBY_ID, { label: 'lobby', reliable: true }); } catch (e) { scheduleLobby(); return; }
             hubConn = c;
@@ -407,7 +410,7 @@
             let hp;
             hubStarting = true;
             try { hp = new Peer(LOBBY_ID, { debug: 0 }); } catch (e) { hubStarting = false; scheduleLobby(); return; }
-            const users = new Map(), conns = new Map(); let dirty = false, timer = null, up = false;
+            const users = new Map(), conns = new Map(); let dirty = false, timer = null, up = false, beat = 0;
             const api = {
                 peer: hp,
                 set(info) {
@@ -431,7 +434,7 @@
                     const t = now();
                     for (const [id, u] of users) if (id !== S.id && t - u.t > 20000) { users.delete(id); dirty = true; }
                     api.set(myInfo());
-                    if (dirty) { dirty = false; api.push(); }
+                    if (dirty || ++beat % 3 === 0) { dirty = false; api.push(); }        // a regular heartbeat even when nothing changed, so clients can tell a dead link from a quiet one
                 }, 2000);
             });
             hp.on('connection', c => {
@@ -457,10 +460,18 @@
             try { if (hubConn) hubConn.close(); } catch (e) { }
             hubConn = null; dir.clear();
         }
-        setInterval(guard('lobbyBeat', () => { if (S.id) sendReg(); }), 1000);
+        setInterval(guard('lobbyBeat', () => {
+            if (!S.id || S.tearing) return;
+            sendReg();
+            // watchdog: "they see me but I don't see them" happens when the link to the directory is half dead. Rebuild it.
+            if (!hub) {
+                if (hubConn && hubConn.open) { if (now() - lastDirAt > 13000) { try { hubConn.close(); } catch (e) { } hubConn = null; scheduleLobby(150); } }
+                else if (now() - lastLobbyTry > 5000) connectLobby();
+            }
+        }), 1000);
 
         function newPeer(id) {
-            const p = { id, name: 'player', ev: null, st: null, buf: [], lc: -1, pvp: true, alive: false, bl: null, blAt: 0, hello: false, cur: null, hue: 0, paused: false, pausedAt: 0, seenAt: now(), fy: undefined, fv: 0 };
+            const p = { id, name: 'player', ev: null, st: null, buf: [], lc: -1, pvp: false, alive: false, bl: null, blAt: 0, hello: false, cur: null, hue: 0, paused: false, pausedAt: 0, seenAt: now(), fy: undefined, fv: 0 };
             let h = 0; for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) % 360; p.hue = h;
             S.peers.set(id, p); return p;
         }
@@ -485,7 +496,7 @@
         function attach(c, outgoing) {
             const pid = c.peer; const slot = c.label === 'st' ? 'st' : 'ev';
             const initiator = outgoing ? S.id : pid; c._init = initiator;
-            if (!S.peers.has(pid) && S.peers.size >= CFG.maxPeers) { try { c.close(); } catch (e) { } return; }
+            if (!S.peers.has(pid) && S.peers.size + 1 >= Math.min(CFG.maxPeers, S.room.max)) { try { c.close(); } catch (e) { } return; }
             const p = S.peers.get(pid) || newPeer(pid);
             const cur = p[slot];
             const curDead = cur && cur._was && !cur.open;                          // opened once, closed since: not a real duplicate
@@ -626,7 +637,8 @@
         const onDataSafe = guard('net.data', onData);
 
         H.hello = (p, d) => {
-            p.name = String(d.name || 'player').slice(0, 20); p.hello = true; p.pvp = d.pvp !== false; p.seenAt = now(); p.dead = d.dead === true;
+            if (S.isHost) setTimeout(() => sendRoom(p.id), 400);
+            p.name = String(d.name || 'player').slice(0, 20); p.hello = true; p.pvp = d.pvp === true; p.seenAt = now(); p.dead = d.dead === true;
             if (typeof d.ep === 'string' && d.ep !== p.ep) { p.ep = d.ep; p.lastSeq = -1; p.offMin = null; p.buf = []; }
             if (!S.inGame && d.hostId && (p.id === S.sessionHostId || !S.sessionHostId)) { S.sessionHostId = String(d.hostId); S.hostId = S.sessionHostId; }
             // Peer connections are now permission-based; never auto-connect from a peer roster.
@@ -672,7 +684,7 @@
         // Only the deterministic lobby leader may start a shared run.
         H.startReq = (p, d) => {
             if (!S.isHost || S.inGame || S.loading || S.starting) return;
-            if (d && d.exp && typeof build !== 'undefined' && typeof build.reset === 'function') { try { build.reset(); } catch (e) { simulation.startGame(); } return; }   // experimental mode: everyone opens their own build menu
+            if (d && d.exp && typeof build !== 'undefined' && typeof build.reset === 'function') { try { openBuildMenu(); } catch (e) { simulation.startGame(); } return; }   // experimental mode: everyone opens their own build menu
             simulation.startGame();
         };
         H.start = (p, d) => {
@@ -778,19 +790,28 @@
                 if (mo.alive) killSilently(mo);
             }
         };
+        // A remote press must go through the level's OWN check (`if (button.isUp) { query(); if (!button.isUp) doThing() }`), otherwise levels that
+        // react to a press (gravitron's flip, doors...) never run their action on this client. So a press is delivered to the next query call.
+        function applyRemoteButton(button, up, isEvent) {
+            if (!button) return;
+            if (up) { button._mpPending = false; button.isUp = true; return; }
+            if (button._mpPending) return;                                     // a press is already waiting for the level's next check
+            // only a live press EVENT counts as a press; a snapshot (level start, late join) just copies the state, it must never trigger a level action
+            if (isEvent && button.isUp && !level.isFlipping && simulation.cycle - (S.levelStartCycle | 0) > 120) { button._mpPending = true; button._mpPendingAt = now(); } else button.isUp = false;
+        }
         H.btn = (p, d) => {
-            if (S.isHost || !isHostPeer(p) || (d.lc | 0) !== LC() || !Number.isInteger(d.i) || d.i < 0) return;
+            if (S.isHost || !isHostPeer(p) || (d.lc | 0) !== LC() || typeof d.i !== 'string' || d.i.length > 24) return;
             const state = { up: !!d.up, cy: Number.isFinite(d.cy) ? d.cy : simulation.cycle };
             S.remoteButtons.set(d.i, state);
-            const button = S.buttons[d.i]; if (button) button.isUp = state.up;
+            applyRemoteButton(S.buttons[d.i], state.up, true);
         };
         H.btns = (p, d) => {
             if (S.isHost || !isHostPeer(p) || (d.lc | 0) !== LC() || !Array.isArray(d.l)) return;
             for (const e of d.l.slice(0, 300)) {
-                if (!Array.isArray(e) || !Number.isInteger(e[0]) || e[0] < 0) continue;
+                if (!Array.isArray(e) || typeof e[0] !== 'string' || e[0].length > 24) continue;
                 const state = { up: !!e[1], cy: Number.isFinite(d.cy) ? d.cy : simulation.cycle };
                 S.remoteButtons.set(e[0], state);
-                const button = S.buttons[e[0]]; if (button) button.isUp = state.up;
+                applyRemoteButton(S.buttons[e[0]], state.up);
             }
         };
         H.dm = (p, d) => {
@@ -893,6 +914,12 @@
             }
         };
         // ---- experimental mode: everybody builds in their own menu; the shared run only starts once everyone is done ----
+        // The title screen's experiment button does more than build.reset(): it hides the title buttons, shows the grid and turns page scrolling on.
+        // A guest that skipped all that could not scroll the selection screen. Use the real thing.
+        function openBuildMenu() {
+            if (typeof openExperimentMenu === 'function') return openExperimentMenu();
+            return build.reset();
+        }
         H.exp = (p, d) => {
             if (!S.peers.has(p.id) || typeof d.st !== 'string') return;
             if (d.st === 'sel' || d.st === 'ready') p.exp = d.st; else if (d.st === 'go') p.exp = null;
@@ -907,6 +934,37 @@
             sendEv({ t: 'exp', st: 'go' });
             try { go(); } catch (e) { console.warn('[MP] experimental start failed', e); }
         }
+        // ---- difficulty (black orb) is host-authoritative ----
+        function applyDifficulty(opts) {
+            try {
+                const dfc = powerUps.difficulty; const o = cleanDiff(opts); if (!o || !dfc) return;
+                const initial = { ...simulation.difficultyOptions };
+                const sel = dfc.normalize(o);
+                if (dfc.signature(initial) === dfc.signature(sel)) return;
+                S.diffApplying = true;
+                simulation.difficultyOptions = sel;
+                dfc.updateScale();
+                const tierChanged = initial.isMobTier23 !== sel.isMobTier23 || initial.isMobTier4 !== sel.isMobTier4;
+                dfc.setDamageAndDefense(tierChanged);
+                if (tierChanged && level.levelsCleared > 0 && typeof spawn !== 'undefined' && spawn.mobTypeSpawnOrder) {
+                    spawn.mobTypeSpawnIndex = level.levelsCleared + 1;
+                    spawn.pickList = [spawn.mobTypeSpawnOrder[Math.min(level.levelsCleared - 1, 13)], spawn.mobTypeSpawnOrder[Math.min(level.levelsCleared, 13)]];
+                }
+                level.updateDifficulty();
+                if (initial.isConstraint !== sel.isConstraint || initial.isStrongerConstraints !== sel.isStrongerConstraints) level.setConstraints();
+                lore.setTechGoal();
+                try { ui.banner('The host changed the difficulty.'); setTimeout(() => ui.banner(null), 3000); } catch (e) { }
+            } catch (e) { console.warn('[MP] applyDifficulty', e); }
+            finally { S.diffApplying = false; }
+        }
+        H.diff = (p, d) => { if (!isHostPeer(p) || S.isHost || S.solo || !S.inGame) return; applyDifficulty(d.o); };
+        H.name = (p, d) => { if (!S.peers.has(p.id)) return; const n = cleanName(d.name); if (n) { p.name = n; ui.refresh(); } };
+        function sendRoom(to) { sendEv({ t: 'room', pvp: S.pvp ? 1 : 0, tg: S.together ? 1 : 0, max: S.room.max, ask: S.room.ask ? 1 : 0 }, to); }
+        H.room = (p, d) => {
+            if (!S.peers.has(p.id) || S.isHost || !isHostPeer(p)) return;                    // only the host decides the room settings
+            S.pvp = d.pvp === 1; S.together = d.tg !== 0; S.room.ask = d.ask !== 0; S.room.max = Math.max(2, Math.min(12, d.max | 0 || 8));
+            ui.refresh();
+        };
         H.po = (p, d) => {
             if (!S.peers.has(p.id) || S.solo || S.loading || !S.inGame || (d.lc | 0) !== LC() || !Array.isArray(d.l) || p.dead) return;
             const t = now(); if (!p._po || t - p._po.t > 1000) p._po = { t, n: 0 };
@@ -1116,7 +1174,8 @@
             if (m.health > 0.01) m.health = 0.001;
             const live = livingOthers().filter(p => p.cur && Number.isFinite(p.cur.x)).sort((a, b) => a.id < b.id ? -1 : 1)[0];
             if (live) {
-                const x = live.cur.x, y = live.cur.y - 40;
+                const x = live.cur.x, y = live.cur.y;
+                try { simulation.mouse.x = canvas.width2; simulation.mouse.y = canvas.height2; } catch (e) { }   // no look-ahead offset: the camera sits exactly on the spectated player
                 Matter.Body.setPosition(player, { x, y }); Matter.Body.setVelocity(player, { x: 0, y: 0 });
                 if (m.pos) { m.pos.x = x; m.pos.y = y; }
             }
@@ -1182,7 +1241,7 @@
             }
             S.applying = true;
             try {
-                if (exp && typeof build !== 'undefined' && typeof build.reset === 'function') { build.reset(); }   // experimental mode: opens this player's own build menu (it starts the shared run itself)
+                if (exp && typeof build !== 'undefined' && typeof build.reset === 'function') { openBuildMenu(); }   // experimental mode: opens this player's own build menu (it starts the shared run itself)
                 else simulation.startGame();
             }
             catch (e) { console.warn('[MP] could not start game', e); }
@@ -1313,13 +1372,13 @@
             }
         });
         wrapFn(simulation, 'clearMap', 'simulation.clearMap', orig => function () { onClearPre(); return orig.apply(this, arguments); });
-        const onLevelStart = guard('level.start.post', () => { S.inGame = true; S.starting = false; afterLevelLoaded(); });
+        const onLevelStart = guard('level.start.post', () => { S.levelStartCycle = simulation.cycle; S.inGame = true; S.starting = false; afterLevelLoaded(); });
         // Build every level from the SAME random numbers on every client:
         //  1. the seed is derived from (run seed, level number), independent of anything else that happened in the run
         //  2. plain Math.random (used by some map generators for sizes, counts and drops) is swapped for the seeded generator
         const hooked = wrapFn(level, 'start', 'level.start', orig => function () {
             S.buildingLevel = true;
-            S.buttons = []; S.buttonSeq = 0; S.buttonSent.clear(); S.remoteButtons.clear();
+            S.buttons = Object.create(null); S.buttonSeq = 0; S.buttonSent.clear(); S.remoteButtons.clear();
             const realRandom = Math.random;
             const realSeed = Math.seed;
             const seeded = Math.seededRandom;
@@ -1352,13 +1411,13 @@
         function sendButtonSnapshot(to) {
             if (!S.isHost || !S.inGame || S.solo || !hasPeers()) return;
             const list = [];
-            for (let i = 0; i < S.buttons.length; i++) {
+            for (const i of Object.keys(S.buttons)) {
                 const b = S.buttons[i]; if (b) list.push([i, !!b.isUp]);
             }
             sendEv({ t: 'btns', lc: LC(), cy: simulation.cycle, l: list }, to);
         }
         function publishButtonState(button) {
-            if (!S.isHost || S.solo || !hasPeers() || !button || !Number.isInteger(button._mpButtonId)) return;
+            if (!S.isHost || S.solo || !hasPeers() || !button || typeof button._mpButtonId !== 'string') return;
             const i = button._mpButtonId, up = !!button.isUp;
             if (S.buttonSent.get(i) === up) return;
             S.buttonSent.set(i, up);
@@ -1371,7 +1430,13 @@
                 if (Array.isArray(bodies) && bodies.length === 1 && bodies[0] === player) {
                     const all = [player];
                     // paused players are standing still and can't press buttons on purpose
-                    for (const g of ghosts.values()) { const pp = S.peers.get(g.gid); if (g && g.alive && g.position && pp && !peerPaused(pp)) all.push(g); }
+                    const hw = (player.bounds.max.x - player.bounds.min.x) / 2, hh = (player.bounds.max.y - player.bounds.min.y) / 2;   // a remote player is as big as a real one (the ghost circle is smaller and would miss buttons)
+                    for (const g of ghosts.values()) {
+                        const pp = S.peers.get(g.gid);
+                        if (!(g && g.alive && g.position && pp && !pp.dead && !peerPaused(pp))) continue;
+                        const cy = g.position.y + (Number.isFinite(pp.yOff) ? pp.yOff : 49);                // the ghost sits at m.pos; the real body centre is yOff lower
+                        all.push({ bounds: { min: { x: g.position.x - hw, y: cy - hh }, max: { x: g.position.x + hw, y: cy + hh } }, position: { x: g.position.x, y: cy } });
+                    }
                     return region.call(this, all, bounds);
                 }
                 return region.apply(this, arguments);
@@ -1381,8 +1446,11 @@
         function wrapButtons() {
             wrapFn(level, 'button', 'level.button', orig => function () {
                 const button = orig.apply(this, arguments);
-                const id = S.buttonSeq++;
+                // Identified by position, not creation order: levels that rebuild themselves in place (gravitron's flip) create buttons at times that
+                // differ between clients, which used to shift every later id.
+                const id = (button && button.min && Number.isFinite(button.min.x)) ? Math.round(button.min.x) + ':' + Math.round(button.min.y) : 'n' + (S.buttonSeq++);
                 button._mpButtonId = id;
+                if (S.buttons[id] && S.buttons[id] !== button) { S.remoteButtons.delete(id); S.buttonSent.delete(id); }   // the level rebuilt this button: forget the old object's state
                 S.buttons[id] = button;
                 for (const method of ['query', 'queryRemove', 'queryPlayer']) {
                     const original = button[method];
@@ -1394,6 +1462,13 @@
                             return result;
                         }
                         const state = S.remoteButtons.get(id);
+                        if (this._mpPending) {
+                            this._mpPending = false;
+                            if (now() - (this._mpPendingAt || 0) < 700) {                    // a press that is still fresh: the level reacts to it exactly once
+                                for (const k in S.buttons) if (S.buttons[k]) S.buttons[k]._mpPending = false;      // the other buttons of the same press (floor + ceiling pair) are the same press
+                                this.isUp = false; return undefined;
+                            }
+                        }
                         if (state) this.isUp = state.up;
                         return undefined;
                     };
@@ -1549,7 +1624,7 @@
             mobMap.clear(); bodyMap.clear(); puMap.clear(); bodySnapshotSeen = null;
             spawnQ = []; deathQ = []; opsQ = []; dropQ = []; ownPuQ = []; fxQ = []; dmgOut.clear(); pvpOut.clear();
             S.aliveIds = null; S.mc = null; S.ctr = 0; S.hostCy = null;
-            S.buttons = []; S.buttonSeq = 0; S.buttonSent.clear(); S.remoteButtons.clear();
+            S.buttons = Object.create(null); S.buttonSeq = 0; S.buttonSent.clear(); S.remoteButtons.clear();
             S.mapIds = null; S.mapSent = new Map(); S.mapBase = new Map();
         }
         function afterLevelLoaded() {
@@ -1935,8 +2010,8 @@
         const VM = { cur: null, bad: false, active: false, frame: 0, sentFrame: 0, gid: 0, latest: new Map(), grads: 0, epArr: null, depthRec: 0 };
         const vmNum = (v, d) => { const n = Number(v); return Number.isFinite(n) ? String(+n.toFixed(d)) : '0'; };
         const vmCol = c => '~' + String(c).replace(/[;,]/g, m => m === ',' ? '|' : '').slice(0, 60);
-        const VM_COLOR = /^(rgba?\([0-9., %\-]+\)|hsla?\([0-9., %\-]+\)|#[0-9a-fA-F]{3,8}|[a-zA-Z]{3,24})$/;
-        const VM_COMP = new Set(['source-over', 'lighter', 'multiply', 'screen', 'overlay', 'destination-out', 'source-atop', 'xor', 'difference', 'darken', 'lighten']);
+        const VM_COLOR = /^(rgba?\([0-9., %\-\/]+\)|hsla?\([0-9., %\-\/deg]+\)|#[0-9a-fA-F]{3,8}|[a-zA-Z]{3,24})$/;
+        const VM_COMP = new Set(['source-over', 'lighter', 'multiply', 'screen', 'overlay', 'destination-out', 'source-atop', 'xor', 'difference', 'exclusion', 'darken', 'lighten', 'color-dodge', 'color-burn', 'hard-light', 'soft-light', 'hue', 'saturation', 'color', 'luminosity']);
         const VM_CAP = new Set(['butt', 'round', 'square']), VM_JOIN = new Set(['miter', 'round', 'bevel']);
         const VM_ARGS = { B: 0, Z: 0, M: 2, L: 2, A: 6, E: 8, Q: 4, C: 6, R: 4, T: 5, F: 0, S: 0, P: 4, O: 4, V: 0, W: 0, X: 2, Y: 1, D: 2, U: 6, K: 0, a: 1, e: 1, h: 1, J: 1, l: 1 };
         function vmStr(code, args, prec) {
@@ -2036,6 +2111,7 @@
             if (!obj || typeof obj[key] !== 'function') { HOOKS['vm.' + gkey] = false; return; }
             let raw = obj[key];
             const wrapper = function () {
+                if (gkey === 'skin' && S.dead && !S.solo) return;                       // an eliminated player's own body is not drawn (it would float above the teammate being spectated)
                 if (!VM.active || VM.cur) return raw.apply(this, arguments);
                 const p = m.pos || player.position;
                 vmBegin(kind, gkey, p.x, p.y, 0, 0);
@@ -2200,7 +2276,7 @@
                 if (flash && now() - vm.at > 110) continue;                                          // flashes are shown briefly, once
                 const g = flash ? { ...g0, k: g0.k - 10 } : g0;
                 let dx = 0, dy = 0;
-                if (g.k === 0) { if (!cur) continue; if (g.key === 'hold' && p.fm === 7) continue; dx = cur.x - g.ax; dy = cur.y - g.ay; }   // cloaking: its big white circle is a view effect for the owner only
+                if (g.k === 0) { if (!cur) continue; if (/^hold/.test(g.key) && p.fm === 7) continue; dx = cur.x - g.ax; dy = cur.y - g.ay; }   // cloaking: its big white circle is a view effect for the owner only
                 else if (g.k === 1) { dx = g.vx * fr; dy = g.vy * fr; }
                 ctx.save();
                 try {
@@ -2291,7 +2367,7 @@
                 const w = 60, hp = Math.max(0, Math.min(1, (pp.hp || 0) / Math.max(0.0001, pp.mhp || 1)));
                 ctx.fillStyle = 'rgba(100,100,100,0.4)'; ctx.fillRect(s.x - w / 2, s.y - 55, w, 6);
                 ctx.fillStyle = 'rgba(255,0,0,0.75)'; ctx.fillRect(s.x - w / 2, s.y - 55, w * hp, 6);
-                ctx.fillStyle = '#000'; ctx.font = '24px Arial'; ctx.textAlign = 'center'; ctx.fillText(pp.name + (pz ? ' (paused)' : ''), s.x, s.y - 65);
+                { const lbl = pp.name + (pz ? ' (paused)' : ''); ctx.font = 'bold 26px Arial'; ctx.textAlign = 'center'; ctx.lineJoin = 'round'; ctx.lineWidth = 6; ctx.strokeStyle = 'rgba(255,255,255,0.92)'; ctx.strokeText(lbl, s.x, s.y - 78); ctx.fillStyle = '#111'; ctx.fillText(lbl, s.x, s.y - 78); }
                 ctx.restore();
                 if (!pz) drawVm(pp);
             });
@@ -2394,7 +2470,7 @@
                     kind = 1;
                     w = Math.hypot(vt[1].x - vt[0].x, vt[1].y - vt[0].y);
                     h = Math.hypot(vt[2].x - vt[1].x, vt[2].y - vt[1].y);
-                } else if (vt && vt.length > 4 && vt.length <= 24) {
+                } else if (vt && vt.length >= 3 && vt.length !== 4 && vt.length <= 24) {
                     // polygons with more than four vertices (missiles, spores, balls...): send the REAL shape, relative to the centre
                     const poly = [q(bl.position.x), q(bl.position.y), q(bl.velocity.x, 10), q(bl.velocity.y, 10), vt.length];
                     for (const v of vt) poly.push(q(v.x - bl.position.x, 10) / 10, q(v.y - bl.position.y, 10) / 10);
@@ -2572,25 +2648,29 @@
             };
             const css = document.createElement('style');
             css.textContent = `
-#mp-panel{width:min(350px,calc(100vw - 24px));max-height:55vh;overflow:auto;box-sizing:border-box;font:13px Arial,sans-serif;color:#eee;background:var(--card-color,rgba(20,24,30,.96));border:1px solid rgba(255,255,255,.22);border-radius:8px;padding:10px;margin-top:6px;box-shadow:0 6px 24px rgba(0,0,0,.25)}
-#mp-namebar{position:fixed;top:10px;left:12px;right:auto;z-index:9998;display:flex;gap:5px;align-items:center;padding:6px 8px;border:1px solid #bbb;border-radius:8px;background:#fff;color:#111;font:12px Arial,sans-serif;box-shadow:0 2px 10px rgba(0,0,0,.2)}
-#mp-namebar input{width:130px;max-width:30vw;background:#fff;color:#111;border:1px solid #999;border-radius:5px;padding:5px}
-#mp-namebar button{background:#eee;color:#111;border:1px solid #999;border-radius:5px;padding:5px 9px;cursor:pointer}
-#mp-panel button{background:#343d49;color:#f5f5f5;border:1px solid #657080;border-radius:5px;padding:5px 9px;cursor:pointer}
+#mp-panel{width:min(360px,calc(100vw - 24px));max-height:60vh;overflow:auto;box-sizing:border-box;font:14px/1.35 Arial,Helvetica,sans-serif;color:#f4f6f8;background:#1b2129;border:1px solid #556070;border-radius:8px;padding:10px 12px;text-shadow:none}
+
+
+
+#mp-panel button{background:#3a4658;color:#fff;border:1px solid #7a8aa0;border-radius:5px;padding:5px 9px;cursor:pointer;font-size:13px}
 #mp-notice{position:fixed;right:14px;top:54px;z-index:10001;width:min(340px,calc(100vw - 28px));padding:12px;background:rgba(24,29,37,.98);color:#fff;border:1px solid #647184;border-radius:10px;box-shadow:0 8px 28px rgba(0,0,0,.45);font:13px Arial,sans-serif}
 #mp-notice strong{display:block;margin-bottom:5px;font-size:14px}#mp-notice .actions{display:flex;gap:7px;margin-top:10px}#mp-notice button{flex:1;padding:7px;border-radius:6px;border:1px solid #68778b;background:#394657;color:white;cursor:pointer}#mp-notice button.primary{background:#287a58;border-color:#43a77b}
 #mp-panel *{box-sizing:border-box}
 #mp-panel h3{margin:0 0 6px;font-size:15px;display:flex;justify-content:space-between;align-items:center}
 #mp-panel .r{display:flex;gap:4px;align-items:center;margin:5px 0;flex-wrap:wrap}
-#mp-panel input[type=text]{flex:1;min-width:0;padding:3px 5px;background:#111820;color:#fff;border:1px solid #586474;border-radius:5px}
+#mp-panel input[type=text]{flex:1;min-width:0;padding:5px 7px;font-size:14px;background:#0f141a;color:#fff;border:1px solid #6b7889;border-radius:5px}
+#mp-panel select{background:#0f141a;color:#fff;border:1px solid #6b7889;border-radius:5px;padding:3px 5px;font-size:14px}
+#mp-panel label{color:#f4f6f8;font-size:14px}
+#mp-panel .sec{margin-top:8px;padding-top:6px;border-top:1px solid rgba(255,255,255,.2);font-weight:bold;color:#fff}
+#mp-panel input:disabled,#mp-panel select:disabled{opacity:.55}
 #mp-panel button{cursor:pointer;padding:2px 8px}
 #mp-panel .pl{display:flex;align-items:center;gap:6px;padding:7px 2px;border-top:1px solid rgba(255,255,255,.13)}
 #mp-panel .pl .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:bold}
-#mp-panel .pl .sub{font-size:11px;color:#aab3c0;font-weight:normal}
-#mp-panel .muted{color:#aab3c0;font-size:12px}
+#mp-panel .pl .sub{font-size:12px;color:#c4ccd7;font-weight:normal}
+#mp-panel .muted{color:#c4ccd7;font-size:13px}
 #mp-panel .dot{width:8px;height:8px;border-radius:50%;background:#3a3;flex:none}
 #multiplayer-details>summary{cursor:pointer;pointer-events:auto}
-@media(max-width:600px){#mp-namebar{top:8px;left:8px}#mp-namebar input{width:95px}#mp-panel{max-height:45vh}}
+@media(max-width:600px){#mp-panel{max-height:45vh}}
 `;
             document.head.appendChild(css);
 
@@ -2603,14 +2683,7 @@
             panel.className = 'details-div';
             if (details) details.appendChild(panel);
 
-            const namebar = document.createElement('div');
-            namebar.id = 'mp-namebar';
-            mk('span', 'Username', namebar);
-            const topName = mk('input', '', namebar);
-            topName.type = 'text'; topName.maxLength = 20;
-            topName.value = S.baseName; topName.placeholder = 'username';
-            const topSet = mk('button', 'Set', namebar);
-            document.body.appendChild(namebar);
+            const namebar = { style: {}, addEventListener() { } };   // the floating username box is gone (it covered the game); the name lives in the panel
 
             const mkStop = e => e.stopPropagation();
             const notice = document.createElement('div');
@@ -2624,26 +2697,60 @@
 
             const h = mk('h3', '', panel);
             mk('span', 'Online players', h);
+            const nr = mk('div', '', panel, 'r');
+            mk('span', 'Your name', nr);
+            const topName = mk('input', '', nr);
+            topName.type = 'text'; topName.maxLength = 20; topName.value = S.baseName; topName.placeholder = 'username';
             const me = mk('div', '', panel, 'muted');
             const list = mk('div', '', panel);
+            mk('div', 'Room settings', panel, 'sec');
+            const rs = mk('div', '', panel, 'muted');
             const r = mk('div', '', panel, 'r');
             const t1 = mk('label', '', r);
             const tcb = mk('input', '', t1); tcb.type = 'checkbox'; tcb.checked = S.together;
             mk('span', ' stay together', t1);
             const t2 = mk('label', '', r);
             const pcb = mk('input', '', t2); pcb.type = 'checkbox'; pcb.checked = S.pvp;
-            mk('span', ' pvp', t2);
+            mk('span', ' pvp (off by default)', t2);
+            const r2 = mk('div', '', panel, 'r');
+            const t3 = mk('label', '', r2);
+            const acb = mk('input', '', t3); acb.type = 'checkbox'; acb.checked = S.room.ask;
+            mk('span', ' ask me before players join', t3);
+            const t4 = mk('label', '', r2);
+            mk('span', 'max players ', t4);
+            const msel = mk('select', '', t4);
+            for (let n = 2; n <= 12; n++) { const o = mk('option', String(n), msel); o.value = String(n); }
+            msel.value = String(S.room.max);
             const st = mk('div', 'Status: ...', panel, 'muted');
-            tcb.onchange = () => { S.together = tcb.checked; };
-            pcb.onchange = () => { S.pvp = pcb.checked; };
+            const roomEditable = () => S.isHost || !hasPeers();
+            const roomChanged = () => {
+                if (!roomEditable()) { syncRoom(); return; }
+                S.together = tcb.checked; S.pvp = pcb.checked; S.room.ask = acb.checked; S.room.max = Math.max(2, Math.min(12, +msel.value || 8));
+                sendRoom();
+                syncRoom();
+            };
+            tcb.onchange = pcb.onchange = acb.onchange = msel.onchange = roomChanged;
+            function syncRoom() {                                       // show the real values; only the host (or someone alone) can change them
+                tcb.checked = !!S.together; pcb.checked = !!S.pvp; acb.checked = !!S.room.ask; msel.value = String(S.room.max);
+                const ed = roomEditable();
+                tcb.disabled = pcb.disabled = acb.disabled = msel.disabled = !ed;
+                let info = ed ? 'You are the host: these settings apply to everyone.' : 'Set by the host - you cannot change them.';
+                try { info += ' Seed ' + getSeed() + ' - difficulty ' + (simulation.difficultyMode != null ? ['easy', 'normal', 'hard', 'why'][simulation.difficultyMode] || simulation.difficultyMode : '?') + (simulation.isCommunityMaps ? ' - community maps' : ''); } catch (e) { }
+                rs.textContent = info;
+            }
 
+            // the name applies by itself shortly after typing stops (no Set button)
+            let nameTimer = 0;
             const applyName = () => {
+                clearTimeout(nameTimer);
                 const n = cleanName(topName.value);
-                if (!n) return;
+                if (!n || n === S.baseName) return;
                 try { localStorage.setItem('p2pUsername', n); } catch (e) {}
+                if (hasPeers()) { S.name = n; S.baseName = n; sendEv({ t: 'name', name: n }); refresh(); return; }   // connected: keep the connection, just rename
                 startPeer(n);
             };
-            topSet.onclick = applyName;
+            topName.addEventListener('input', () => { clearTimeout(nameTimer); nameTimer = setTimeout(applyName, 1200); });
+            topName.addEventListener('change', applyName);
             topName.addEventListener('keydown', e => { if (e.key === 'Enter') applyName(); });
 
             if (details) {
@@ -2661,7 +2768,8 @@
                 const summary = details && details.querySelector('summary');
                 if (summary) summary.textContent = 'multiplayer (' + Math.max(users.length, S.id ? 1 : 0) + ' online)';
                 list.textContent = '';
-                if (!users.length) mk('div', S.id ? 'Looking for other players...' : 'Connecting...', list, 'muted');
+                if (!users.length) mk('div', S.id ? 'Looking for other players...' : 'Connecting to the network...', list, 'muted');
+                else if (S.id && !hub && !(hubConn && hubConn.open)) mk('div', 'Reconnecting to the player list...', list, 'muted');
                 for (const u of users) {
                     const p = S.peers.get(u.id), conn = !!(p && p.ev && p.ev.open);
                     const row = mk('div', '', list, 'pl');
@@ -2682,7 +2790,7 @@
                 }
             }
             function refresh() {
-                namebar.style.display = (S.inGame || S.loading) ? 'none' : 'flex';
+                syncRoom();
                 const open = openPeers();
                 const people = S.id ? (open.length ? 'connected to ' + open.map(p => p.name).join(', ') + ' (' + (open.length + 1) + ' players, you are the ' + (S.isHost ? 'host' : 'client') + ')' : 'not connected to anyone yet') : 'connecting...';
                 st.textContent = 'Status: ' + people;
@@ -2773,6 +2881,20 @@
         wrapPopulateLevels();
         wrapLevelFrameRandom();
         wrapNewFeatures();
+        if (typeof powerUps !== 'undefined' && powerUps.difficulty) {
+            wrapFn(powerUps.difficulty, 'effect', 'powerUps.difficulty.effect', orig => function () {
+                if (S.inGame && !S.solo && hasPeers() && !S.isHost) {
+                    try { ui.banner('Only the host chooses the difficulty.'); setTimeout(() => ui.banner(null), 2500); } catch (e) { }
+                    return;
+                }
+                return orig.apply(this, arguments);
+            });
+            wrapFn(powerUps.difficulty, 'updateScale', 'difficulty.updateScale', orig => function () {
+                const r = orig.apply(this, arguments);
+                if (S.isHost && !S.solo && S.inGame && !S.diffApplying && hasPeers()) sendEv({ t: 'diff', o: cleanDiff(simulation.difficultyOptions) });
+                return r;
+            });
+        }
         if (typeof build !== 'undefined' && build) {
             wrapFn(build, 'reset', 'build.reset', orig => function () {
                 const r = orig.apply(this, arguments);
