@@ -1,5 +1,5 @@
 /*
- * n-gon multiplayer v10-A (visual mirror) / v9-E  (v9-D + match management: host-authoritative level changes, reconnect/late-join parity, duplicate-connection fix, training isolation; combat sync: duplicate-damage guards, mirrored explosions, bullets on the ghost time base, field/immunity visuals; elimination + revival; ordered snapshots; world sync fixes; permission-based joins)
+ * n-gon multiplayer v10-C (visual mirror, guest mob effects, printed flag, real bullet shapes, cloak fix, spectators non-solid, pilot wave claim, shared experimental mode) / v9-E  (v9-D + match management: host-authoritative level changes, reconnect/late-join parity, duplicate-connection fix, training isolation; combat sync: duplicate-damage guards, mirrored explosions, bullets on the ghost time base, field/immunity visuals; elimination + revival; ordered snapshots; world sync fixes; permission-based joins)
  *
  * Design
  *  - Every client runs its OWN player, guns, techs and fields with the game's normal code.
@@ -145,7 +145,7 @@
             catchTarget: -1, catchRunning: false,
             runSeed: null, remotePending: false,
             paused: false, pausedAt: 0, stuck: 0, lastCycle: -1, hostCy: null,
-            dmgSeq: 0, fxSeq: 0, epoch: (crypto.getRandomValues(new Uint32Array(1))[0]).toString(36), sendSeq: 0, dead: false, deadLc: -1, deadAt: 0, revivedLc: -1, revAuth: -1, forceDeath: false, reviveTimer: null,
+            dmgSeq: 0, fxSeq: 0, mfxSeq: 0, epoch: (crypto.getRandomValues(new Uint32Array(1))[0]).toString(36), sendSeq: 0, dead: false, deadLc: -1, deadAt: 0, revivedLc: -1, revAuth: -1, forceDeath: false, reviveTimer: null,
             buttons: [], buttonSeq: 0, buttonSent: new Map(), remoteButtons: new Map(),
             buildingLevel: false, lastRosterAt: 0, lastButtonSnapshotAt: 0,
             solo: false, savePending: false, saveStarted: false, saveWatching: false, olWarned: -1, forceLv: null, forceFlip: null, forceDf: null,
@@ -645,14 +645,15 @@
         };
         H.seed = (p, d) => { if (isHostPeer(p) && !S.inGame && d.seed != null) setSeed(String(d.seed)); };
         // Only the deterministic lobby leader may start a shared run.
-        H.startReq = (p) => {
+        H.startReq = (p, d) => {
             if (!S.isHost || S.inGame || S.loading || S.starting) return;
+            if (d && d.exp && typeof build !== 'undefined' && typeof build.reset === 'function') { try { build.reset(); } catch (e) { simulation.startGame(); } return; }   // experimental mode: everyone opens their own build menu
             simulation.startGame();
         };
         H.start = (p, d) => {
             if (!isHostPeer(p) || S.inGame || S.loading || S.starting || d.seed == null) return;
             S.runSeed = String(d.seed);
-            beginRun(S.runSeed, d.lv, d.fl, d.df);
+            beginRun(S.runSeed, d.lv, d.fl, d.df, !!d.exp);
         };
         H.lvl = (p, d) => {
             if (!S.together || !S.inGame || S.solo || !Number.isFinite(Number(d.lc))) return;
@@ -888,7 +889,7 @@
             const a = d.p;
             if (Array.isArray(a) && a.length >= 16 && a.slice(0, 16).every(Number.isFinite)) {
                 const wasPaused = p.paused;
-                p.alive = !!a[5]; p.pvp = !!a[12]; p.mhp = Math.max(0.0001, Math.min(1e6, a[11] / 1000)); p.hp = Math.max(0, Math.min(p.mhp, a[10] / 1000)); p.og = !!a[13]; p.yOff = a[14]; p.paused = !!a[15]; p.dead = a[16] === 1; p.fa = a[17] === 1; p.imm = a[18] === 1; p.fr = Number.isFinite(a[19]) ? Math.max(0, Math.min(400, a[19])) : 0;
+                p.alive = !!a[5]; p.pvp = !!a[12]; p.mhp = Math.max(0.0001, Math.min(1e6, a[11] / 1000)); p.hp = Math.max(0, Math.min(p.mhp, a[10] / 1000)); p.og = !!a[13]; p.fm = a[7]; p.yOff = a[14]; p.paused = !!a[15]; p.dead = a[16] === 1; p.fa = a[17] === 1; p.imm = a[18] === 1; p.fr = Number.isFinite(a[19]) ? Math.max(0, Math.min(400, a[19])) : 0;
                 if (p.paused && !wasPaused) p.pausedAt = now();
                 p.buf.push({ t: st, x: a[0], y: a[1], vx: a[2] / 100, vy: a[3] / 100, a: a[4] / 1000 });
                 if (p.buf.length > 10) p.buf.shift();
@@ -898,6 +899,7 @@
             if (p.bl && p.bl.length % 8) p.bl.length -= p.bl.length % 8;
             p.blAt = now();
             p.vm = (d.lc === LC() && !S.loading) ? vmParse(d.vm, st) : null;
+            p.bp = (d.lc === LC() && Array.isArray(d.bp) && d.bp.length < 2500) ? d.bp.map(v => Number.isFinite(v) ? v : 0) : null;
             const fromHost = isHostPeer(p);
             if (d.cy != null && fromHost && !S.isHost && !p.paused) S.hostCy = { cy: Number(d.cy), t: now(), lc: p.lc, fi: d.fi };
             if (p.lc !== LC() || S.loading) return;
@@ -1089,14 +1091,14 @@
                 return true;
             });
         }
-        function beginRun(seed, lv, fl, df) {      // join a run started by someone else
+        function beginRun(seed, lv, fl, df, exp) {      // join a run started by someone else
             S.forceLv = Array.isArray(lv) ? lv.map(String).slice(0, 64) : null;
             S.forceFlip = typeof fl === 'boolean' ? fl : null;
             S.forceDf = cleanDiff(df);
             return prepareRoute(S.forceLv).then(ok => {
                 if (!ok) { S.forceLv = null; S.forceFlip = null; }
                 if (S.inGame || S.starting) return;
-                startLocalGame(seed);
+                startLocalGame(seed, exp);
             });
         }
         // level.populateLevels uses plain Math.random for the late "factory/reservoir/interferometer" pick and reads the PER-PLAYER level pool:
@@ -1114,13 +1116,16 @@
                 return undefined;
             });
         }
-        function startLocalGame(seed) {
+        function startLocalGame(seed, exp) {
             if (seed != null) {
                 S.runSeed = String(seed);
                 setSeed(S.runSeed);
             }
             S.applying = true;
-            try { simulation.startGame(); }
+            try {
+                if (exp && typeof build !== 'undefined' && typeof build.reset === 'function') { build.reset(); }   // experimental mode: opens this player's own build menu (it starts the shared run itself)
+                else simulation.startGame();
+            }
             catch (e) { console.warn('[MP] could not start game', e); }
             finally { S.applying = false; }
         }
@@ -1163,7 +1168,8 @@
         });
         wrapFn(simulation, 'startGame', 'simulation.startGame', orig => function () {
             // Training (startGame(false, true)) and build runs (startGame(true)) are private solo runs: nothing is synced.
-            if ((arguments[0] === true || arguments[1] === true) && !S.applying) {
+            const isBuildRun = arguments[0] === true && !arguments[1];
+            if ((arguments[1] === true || (arguments[0] === true && !hasPeers())) && !S.applying) {   // training (and a build run with nobody connected) stays private; a build run with peers is shared
                 S.solo = true; refreshRole();
                 S.runSeed = getSeed(); setSeed(S.runSeed);
                 onStartPre();
@@ -1179,7 +1185,7 @@
             if (loadingSave) S.saveStarted = true;
             // A guest asks the lobby leader to start; it never starts a divergent local run.
             if (!S.applying && hasPeers() && !S.isHost && !loadingSave) {
-                sendEv({ t: 'startReq' }, S.hostId);
+                sendEv({ t: 'startReq', exp: isBuildRun ? 1 : 0 }, S.hostId);
                 return;
             }
             let announce = false;
@@ -1214,7 +1220,7 @@
                 if (S.runSeed == null) S.runSeed = String(getSeed());
                 if (!loadingSave) setSeed(S.runSeed);
                 // tell everyone only NOW: populateLevels has run, so the host's level order and flip are known
-                if (announce && hasPeers()) sendEv({ t: 'start', seed: S.runSeed, ...lvInfo() });
+                if (announce && hasPeers()) sendEv({ t: 'start', seed: S.runSeed, exp: isBuildRun ? 1 : 0, ...lvInfo() });
             };
             // startGame is async (community maps / training load extra levels first): everything after that await runs later
             if (r && typeof r.then === 'function') return r.then(v => { fin(); return v; }, e => { S.starting = false; S.loading = false; throw e; });
@@ -1696,7 +1702,7 @@
         function descBody(bd) {
             const cos = Math.cos(-bd.angle), sin = Math.sin(-bd.angle), cx = bd.position.x, cy = bd.position.y, v = [];
             for (const vt of bd.vertices) { const dx = vt.x - cx, dy = vt.y - cy; v.push(q(dx * cos - dy * sin, 10), q(dx * sin + dy * cos, 10)); }
-            return [bd._nid, q(cx, 10), q(cy, 10), q(bd.angle, 1000), v, bd.friction, bd.frictionAir, bd.restitution, bd.density];
+            return [bd._nid, q(cx, 10), q(cy, 10), q(bd.angle, 1000), v, bd.friction, bd.frictionAir, bd.restitution, bd.density, bd.isPrinted ? 1 : 0];
         }
         function createBody(e) {
             if (bodyMap.has(e[0])) return bodyMap.get(e[0]);
@@ -1714,7 +1720,7 @@
             if (Number.isFinite(e[8]) && e[8] > 0) Body.setDensity(bd, e[8]);
             Body.setAngle(bd, (e[3] || 0) / 1000); Body.setPosition(bd, { x: e[1] / 10, y: e[2] / 10 });
             if (!finiteBody(bd)) return null;
-            bd.classType = 'body'; bd._nid = e[0];
+            bd.classType = 'body'; bd._nid = e[0]; if (e[9] === 1) bd.isPrinted = true;
             Composite.add(engine.world, bd); body.push(bd); bodyMap.set(e[0], bd);
             return bd;
         }
@@ -1748,10 +1754,14 @@
             }
             for (const [id, bd] of bodyMap) if (!cur.has(id)) { bodyMap.delete(id); if (!bd._gone && !bd.isNotHoldable) opsQ.push(['r', id]); }
             const h = m.holdingTarget; if (h && h._nid !== undefined && h._owner !== S.id) claim(h);
+            // fields reach further than 120px (field range, pilot wave's roaming field): take ownership of what OUR field is moving
+            const reach = Math.max(120, (Number(m.fieldRange) || 0) + 40);
+            const pw = (m.fieldMode === 8 && input.field && m.fieldPosition && Number.isFinite(m.fieldRadius)) ? m.fieldPosition : null;
             if (player && player.position) for (const bd of bodyMap.values()) {
                 if (bd._owner === S.id) continue;
+                if (pw && Math.hypot(bd.position.x - pw.x, bd.position.y - pw.y) < m.fieldRadius * 1.3 + 40 && !bd.isNotHoldable) { claim(bd); continue; }
                 const dx = bd.position.x - player.position.x, dy = bd.position.y - player.position.y;
-                if (dx * dx + dy * dy >= 14400) continue;
+                if (dx * dx + dy * dy >= reach * reach) continue;
                 // Levers/toggles are deliberately non-holdable bodies, but their rotation
                 // still needs an owner so the host can accept and replicate the interaction.
                 const moving = Number(bd.speed) > 0.35 || Math.abs(Number(bd.angularVelocity) || 0) > 0.0015;
@@ -1768,6 +1778,67 @@
                 if (S.aliveIds) for (const id of S.aliveIds) if (!curM.has(id)) deathQ.push(id);
                 S.aliveIds = curM;
             }
+        }
+
+        // ------------------------------------------------------------------ mob effects from guests (v10-B)
+        // A guest's mobs are puppets: pushes / forces / stun / slow / DoT applied by the guest's fields and weapons would be
+        // overwritten by the host's positions. We measure what OUR attack phases did to puppets and forward it to the host.
+        let mfxQ = [];
+        const impOut = new Map();   // netId -> [dvx, dvy, dfx, dfy]
+        function impSnap() {
+            if (S.isHost || !S.inGame || S.loading || S.solo) return null;
+            const r = [];
+            for (const mo of mobMap.values()) {
+                if (!mo || !mo._puppet || !mo.alive || !mo.velocity || !mo.force) continue;
+                r.push(mo, mo.velocity.x, mo.velocity.y, mo.force.x, mo.force.y);
+            }
+            return r.length ? r : null;
+        }
+        function impDiff(snap) {
+            if (!snap) return;
+            for (let i = 0; i < snap.length; i += 5) {
+                const mo = snap[i]; if (!mo.alive || mo._nid === undefined) continue;
+                const dvx = mo.velocity.x - snap[i + 1], dvy = mo.velocity.y - snap[i + 2], dfx = mo.force.x - snap[i + 3], dfy = mo.force.y - snap[i + 4];
+                if (Math.abs(dvx) + Math.abs(dvy) < 0.05 && Math.abs(dfx) + Math.abs(dfy) < 1e-7) continue;
+                const e = impOut.get(mo._nid) || [0, 0, 0, 0];
+                e[0] += dvx; e[1] += dvy; e[2] += dfx; e[3] += dfy; impOut.set(mo._nid, e);
+            }
+        }
+        function installMobFx() {
+            const stat = (key, label, defCycles) => wrapFn(mobs, key, label, orig => function (who, a, b2) {
+                try {
+                    if (!S.isHost && who && who._puppet && who._nid !== undefined && !(S.netCtx > 0) && hasPeers()) {
+                        if (key === 'statusDoT') mfxQ.push([who._nid, 'dt', Number(a) || 0, Number(b2) || defCycles]);
+                        else mfxQ.push([who._nid, key === 'statusStun' ? 'st' : 'sl', Number(a) || defCycles]);
+                    }
+                } catch (e) { }
+                return orig.apply(this, arguments);
+            });
+            stat('statusStun', 'mp.statusStun', 180); stat('statusSlow', 'mp.statusSlow', 60); stat('statusDoT', 'mp.statusDoT', 180);
+        }
+        H.mfx = (p, d) => {
+            if (!S.isHost || S.solo || !S.peers.has(p.id) || (d.lc | 0) !== LC() || !Array.isArray(d.l) || p.dead) return;
+            if (Number.isInteger(d.q)) { if (d.q <= (p.mfxQ | 0)) return; p.mfxQ = d.q; }
+            for (const e of d.l.slice(0, 120)) {
+                if (!Array.isArray(e) || typeof e[0] !== 'string') continue;
+                const mo = mobMap.get(e[0]); if (!mo || !mo.alive || mo._puppet) continue;
+                const n = e.slice(2).map(Number); if (!n.every(Number.isFinite)) continue;
+                try {
+                    if (e[1] === 'v') Body.setVelocity(mo, { x: mo.velocity.x + Math.max(-60, Math.min(60, n[0])), y: mo.velocity.y + Math.max(-60, Math.min(60, n[1])) });
+                    else if (e[1] === 'f') { mo.force.x += Math.max(-5, Math.min(5, n[0])); mo.force.y += Math.max(-5, Math.min(5, n[1])); }
+                    else if (e[1] === 'st') mobs.statusStun(mo, Math.max(1, Math.min(900, n[0])));
+                    else if (e[1] === 'sl') mobs.statusSlow(mo, Math.max(1, Math.min(900, n[0])));
+                    else if (e[1] === 'dt') mobs.statusDoT(mo, Math.max(0, Math.min(100, n[0])), Math.max(1, Math.min(900, n[1] || 180)));
+                } catch (er) { }
+            }
+        };
+        function flushMobFx() {
+            for (const [id, e] of impOut) {
+                if (Math.abs(e[0]) + Math.abs(e[1]) >= 0.05) mfxQ.push([id, 'v', +e[0].toFixed(2), +e[1].toFixed(2)]);
+                if (Math.abs(e[2]) + Math.abs(e[3]) >= 1e-7) mfxQ.push([id, 'f', +e[2].toFixed(6), +e[3].toFixed(6)]);
+            }
+            impOut.clear();
+            if (mfxQ.length) { sendEv({ t: 'mfx', lc: LC(), q: ++S.mfxSeq, l: mfxQ.slice(0, 120) }, S.hostId); mfxQ = []; }
         }
 
         // ------------------------------------------------------------------ visual mirror (v10)
@@ -1856,9 +1927,10 @@
                 if (!VM.active || VM.cur) return raw.apply(this, arguments);
                 const p = m.pos || player.position;
                 vmBegin(kind, gkey, p.x, p.y, 0, 0);
-                try { return raw.apply(this, arguments); } finally { vmEnd(); }
+                const snap = impSnap();
+                try { return raw.apply(this, arguments); } finally { vmEnd(); impDiff(snap); }
             };
-            Object.defineProperty(obj, key, { configurable: true, enumerable: true, get() { return wrapper; }, set(f) { raw = f; } });
+            Object.defineProperty(obj, key, { configurable: true, enumerable: true, get() { return wrapper; }, set(f) { if (f !== wrapper && typeof f === 'function') raw = f; } });
             HOOKS['vm.' + gkey] = true;
         }
         function installPhases() {
@@ -1870,6 +1942,7 @@
                 let raw = rawBD;
                 const wrapper = function () {
                     if (!VM.active || VM.cur) return raw.apply(this, arguments);
+                    const snap = impSnap();
                     for (let i = 0, len = bullet.length; i < len; i++) {
                         const bl = bullet[i]; if (!bl) continue;
                         if (!bl._vid) bl._vid = ++VM.gid;
@@ -1877,8 +1950,9 @@
                         vmBegin(1, 'b' + bl._vid, pos.x, pos.y, v.x, v.y);
                         try { bl.do(); } finally { vmEnd(); }
                     }
+                    impDiff(snap);
                 };
-                Object.defineProperty(b, 'bulletDo', { configurable: true, enumerable: true, get() { return wrapper; }, set(f) { raw = f; } });
+                Object.defineProperty(b, 'bulletDo', { configurable: true, enumerable: true, get() { return wrapper; }, set(f) { if (f !== wrapper && typeof f === 'function') raw = f; } });
                 HOOKS['vm.bulletDo'] = true;
             } else HOOKS['vm.bulletDo'] = false;
             // ephemera created by OUR player's code (not by the level, mobs or network handlers) are mirrored too
@@ -1894,6 +1968,7 @@
                 const wrapper = function () {
                     tagArr();
                     if (!VM.active || VM.cur) return raw.apply(this, arguments);
+                    const snap = impSnap();
                     for (let i = simulation.ephemera.length - 1; i >= 0; i--) {
                         const e = simulation.ephemera[i]; if (!e) continue;
                         if (e._own) {
@@ -1902,15 +1977,16 @@
                             try { e.do(); } finally { vmEnd(); }
                         } else e.do();
                     }
+                    impDiff(snap);
                 };
-                Object.defineProperty(simulation, 'runEphemera', { configurable: true, enumerable: true, get() { return wrapper; }, set(f) { raw = f; } });
+                Object.defineProperty(simulation, 'runEphemera', { configurable: true, enumerable: true, get() { return wrapper; }, set(f) { if (f !== wrapper && typeof f === 'function') raw = f; } });
                 HOOKS['vm.ephemera'] = true;
             } else HOOKS['vm.ephemera'] = false;
             wrapFn(mobs, 'loop', 'vm.mobs.loop', orig => function () { S.mobPhase = (S.mobPhase | 0) + 1; try { return orig.apply(this, arguments); } finally { S.mobPhase--; } });
             wrapFn(level, 'start', 'vm.level.start', orig => function () { S.levelPhase = (S.levelPhase | 0) + 1; try { return orig.apply(this, arguments); } finally { S.levelPhase--; } });
         }
         function installVisualMirror() {
-            try { installRecorder(); installPhases(); } catch (e) { console.warn('[MP] visual mirror failed to install', e); }
+            try { installRecorder(); installPhases(); installMobFx(); wrapFn(b, 'bulletDraw', 'mp.timeDilatedGhosts', orig => function () { const r = orig.apply(this, arguments); try { if (m.isTimeDilated && S.inGame && !S.solo) for (const g of ghosts.values()) if (g && g.do) g.do(); } catch (e) { } return r; }); } catch (e) { console.warn('[MP] visual mirror failed to install', e); }
             Matter.Events.on(engine, 'afterUpdate', () => {
                 VM.frame++;
                 VM.active = !!(S.inGame && !S.loading && !S.solo && !S.paused && !S.dead && hasPeers());
@@ -1961,7 +2037,7 @@
                     if (op) ops.push(op);
                 }
                 total += ops.length; if (total > 8000) break;
-                if (ops.length) { groups.push({ k: kind, ax, ay, vx, vy, ops }); if (kind === 0) hasHold = true; }
+                if (ops.length) { groups.push({ k: kind, ax, ay, vx, vy, ops, key: String(e[1]) }); if (kind === 0) hasHold = true; }
             }
             return { g: groups, t: st, at: now(), hasHold };
         }
@@ -2002,7 +2078,7 @@
             const fr = Math.max(-9, Math.min(8, (now() - CFG.interpMs - (Number.isFinite(vm.t) ? vm.t : vm.at)) / stepMs()));
             for (const g of vm.g) {
                 let dx = 0, dy = 0;
-                if (g.k === 0) { if (!cur) continue; dx = cur.x - g.ax; dy = cur.y - g.ay; }
+                if (g.k === 0) { if (!cur) continue; if (g.key === 'hold' && p.fm === 7) continue; dx = cur.x - g.ax; dy = cur.y - g.ay; }   // cloaking: its big white circle is a view effect for the owner only
                 else if (g.k === 1) { dx = g.vx * fr; dy = g.vy * fr; }
                 ctx.save();
                 try {
@@ -2075,11 +2151,14 @@
                 const pp = S.peers.get(this.gid); if (!pp) return;
                 const pz = peerPaused(pp);
                 this.isInvulnerable = pz || pp.imm || !(S.pvp && pp.pvp && pp.alive);
+                const wantMask = (pp.alive && !pp.dead) ? (cat.bullet | cat.body) : 0;      // eliminated / spectating players are not solid and cannot block shots
+                if (this.collisionFilter.mask !== wantMask) this.collisionFilter.mask = wantMask;
                 if (!pz) drawPeerBullets(pp);
                 const s = pp.cur; if (!s || !pp.alive) return;
                 ctx.save();
                 if (pz) ctx.globalAlpha = 0.4;
-                else if (pp.imm) ctx.globalAlpha = (simulation.cycle % 6 < 3) ? 0.45 : 0.9;       // same flicker n-gon shows during damage immunity
+                else if (pp.imm) ctx.globalAlpha = (simulation.cycle % 6 < 3) ? 0.45 : 0.9;
+                else if (pp.fm === 7 && pp.fa) ctx.globalAlpha = 0.3;                                // cloaked: faint, not invisible       // same flicker n-gon shows during damage immunity
                 if (pp.fa && !pz && !(pp.vm && pp.vm.hasHold && now() - pp.vm.at < 250)) {                // field in use (fallback circle when no mirrored drawing)
                     ctx.beginPath(); ctx.arc(s.x, s.y, Math.max(40, pp.fr || 120), 0, 2 * Math.PI);
                     ctx.fillStyle = 'rgba(0,170,255,0.10)'; ctx.fill(); ctx.strokeStyle = 'rgba(0,170,255,0.35)'; ctx.lineWidth = 2; ctx.stroke();
@@ -2108,12 +2187,28 @@
                 else if (!want && ghosts.has(p.id)) removeGhost(p.id);
             }
         }
+        function drawPeerPolys(p, fr, fill) {
+            const a = p.bp; if (!a || !a.length) return;
+            let i = 0;
+            while (i + 5 <= a.length) {
+                const n = a[i + 4] | 0;
+                if (n < 3 || n > 24 || i + 5 + 2 * n > a.length) break;
+                const x = a[i] + a[i + 2] / 10 * fr, y = a[i + 1] + a[i + 3] / 10 * fr;
+                if (Number.isFinite(x) && Number.isFinite(y) && Math.abs(x) < 1e7 && Math.abs(y) < 1e7) {
+                    ctx.beginPath();
+                    for (let j = 0; j < n; j++) { const vx = a[i + 5 + 2 * j], vy = a[i + 6 + 2 * j]; if (Math.abs(vx) > 3000 || Math.abs(vy) > 3000) continue; if (j) ctx.lineTo(x + vx, y + vy); else ctx.moveTo(x + vx, y + vy); }
+                    ctx.closePath(); ctx.fillStyle = fill; ctx.fill();
+                }
+                i += 5 + 2 * n;
+            }
+        }
         function drawPeerBullets(p) {
             const a = p.bl;
-            if (!a || !a.length || now() - p.blAt > CFG.staleMs) return;
+            if (!a || !a.length || now() - p.blAt > CFG.staleMs) { if (p.bp && now() - p.blAt <= CFG.staleMs) { const fr0 = Math.max(-9, Math.min(8, (now() - CFG.interpMs - (Number.isFinite(p.blT) ? p.blT : p.blAt)) / stepMs())); drawPeerPolys(p, fr0, (typeof color !== 'undefined' && color.bullet) || '#000'); } return; }
             // ghosts are drawn interpMs in the past: put their bullets at the same moment (extrapolating backwards a few steps is fine for linear flight)
             const fr = Math.max(-9, Math.min(8, (now() - CFG.interpMs - (Number.isFinite(p.blT) ? p.blT : p.blAt)) / stepMs()));
             const fill = (typeof color !== 'undefined' && color.bullet) || '#000';
+            drawPeerPolys(p, fr, fill);
             for (let i = 0; i + 7 < a.length; i += 8) {
                 const x = a[i] + a[i + 2] / 10 * fr, y = a[i + 1] + a[i + 3] / 10 * fr;
                 const w = a[i + 6], h = a[i + 7], kind = a[i + 4];
@@ -2166,7 +2261,7 @@
             q(m.health, 1000), q(m.maxHealth, 1000), S.pvp ? 1 : 0, m.onGround ? 1 : 0, q(m.yOff), pz ? 1 : 0, S.dead ? 1 : 0, fieldOn() ? 1 : 0, (m.immuneCycle > m.cycle && !S.dead) ? 1 : 0, q(Math.min(400, Number(m.fieldRange) || 0))];
         }
         function bulletSnap() {
-            const out = [], n = bullet.length;
+            const out = [], n = bullet.length; S.polyOut = [];
             if (S.paused || S.dead) return out;
             for (let i = Math.max(0, n - CFG.maxBullets); i < n; i++) {
                 const bl = bullet[i]; if (!bl || !bl.position) continue;
@@ -2176,9 +2271,12 @@
                     kind = 1;
                     w = Math.hypot(vt[1].x - vt[0].x, vt[1].y - vt[0].y);
                     h = Math.hypot(vt[2].x - vt[1].x, vt[2].y - vt[1].y);
+                } else if (vt && vt.length > 4 && vt.length <= 24) {
+                    // polygons with more than four vertices (missiles, spores, balls...): send the REAL shape, relative to the centre
+                    const poly = [q(bl.position.x), q(bl.position.y), q(bl.velocity.x, 10), q(bl.velocity.y, 10), vt.length];
+                    for (const v of vt) poly.push(q(v.x - bl.position.x, 10) / 10, q(v.y - bl.position.y, 10) / 10);
+                    S.polyOut.push(...poly); continue;
                 } else if (bl.bounds) {
-                    // Missiles and many tech projectiles use polygons with more than four
-                    // vertices; send their bounding rectangle instead of misdrawing them as circles.
                     kind = 1;
                     w = bl.bounds.max.x - bl.bounds.min.x;
                     h = bl.bounds.max.y - bl.bounds.min.y;
@@ -2191,6 +2289,7 @@
         function sendState() {
             const pkt = { t: 's', lc: LC(), ep: S.epoch, sq: ++S.sendSeq, ts: Math.round(now() * 10) / 10, p: localPlayer(), bl: bulletSnap() };
             { const vms = VM.active ? vmSnap() : []; if (vms.length) pkt.vm = vms; }
+            if (S.polyOut && S.polyOut.length && S.polyOut.length < 2500) pkt.bp = S.polyOut;
             const bk = [];
             for (const bd of bodyMap.values()) {
                 // Include non-holdable shared doors and moving level machinery too.
@@ -2237,6 +2336,7 @@
                 dmgOut.clear(); sendEv({ t: 'dm', lc, l, q: ++S.dmgSeq }, S.hostId);
             }
             if (pvpOut.size) { for (const [id, d] of pvpOut) sendEv({ t: 'pvp', lc, d, q: ++S.dmgSeq }, id); pvpOut.clear(); }
+            flushMobFx();
             if (fxQ.length) { sendEv({ t: 'fx', lc, q: ++S.fxSeq, l: fxQ.slice(0, 12) }); fxQ = []; }
         }
         // am I paused? (pause menu, upgrade screen, hidden tab, or the game loop simply stopped advancing)
@@ -2272,7 +2372,7 @@
                 wrapSpawns();
                 if (S.tickN % 4 === 0 && S.id && computeHost() !== S.hostId) refreshRole();   // hand the host role to / back from an active player
                 maintainGhosts(); checkMc(); runCatchup();
-                if (!hasPeers()) { opsQ = []; dropQ = []; spawnQ = []; deathQ = []; dmgOut.clear(); pvpOut.clear(); scanWorld(); return; }
+                if (!hasPeers()) { opsQ = []; dropQ = []; spawnQ = []; deathQ = []; dmgOut.clear(); pvpOut.clear(); mfxQ = []; impOut.clear(); scanWorld(); return; }
                 syncCycle();
                 scanWorld(); flush(); sendState();
                 if (S.isHost && hasPeers() && !S.paused) {
@@ -2604,7 +2704,7 @@
         installVisualMirror();
         startPeer(S.baseName);
         window.ngonMP = {
-            S, peers: S.peers, dir, ghosts, mobMap, connect: connectTo, join: joinByName, rename: startPeer, hooks: HOOKS,
+            VM, S, peers: S.peers, dir, ghosts, mobMap, connect: connectTo, join: joinByName, rename: startPeer, hooks: HOOKS,
             diag() {   // paste the output of ngonMP.diag() if something does not sync in your n-gon build
                 const g = n => { try { return (0, eval)('typeof ' + n); } catch (e) { return 'error'; } };
                 const o = {
