@@ -1,5 +1,5 @@
 /*
- * n-gon multiplayer v10-C (visual mirror, guest mob effects, printed flag, real bullet shapes, cloak fix, spectators non-solid, pilot wave claim, shared experimental mode) / v9-E  (v9-D + match management: host-authoritative level changes, reconnect/late-join parity, duplicate-connection fix, training isolation; combat sync: duplicate-damage guards, mirrored explosions, bullets on the ghost time base, field/immunity visuals; elimination + revival; ordered snapshots; world sync fixes; permission-based joins)
+ * n-gon multiplayer v10-F (flash frames, shared self-spawned pickups, experimental ready gate, 9 KB packet budget, hashed mob roster; spectators removed from the world, real skins mirrored, no duplicate mob-death visuals, touch-to-claim blocks; F stability: packet validation/rate limits/chunking, pruning, invalid-body cleanup; visual mirror, guest mob effects, printed flag, real bullet shapes, cloak fix, spectators non-solid, pilot wave claim, shared experimental mode) / v9-E  (v9-D + match management: host-authoritative level changes, reconnect/late-join parity, duplicate-connection fix, training isolation; combat sync: duplicate-damage guards, mirrored explosions, bullets on the ghost time base, field/immunity visuals; elimination + revival; ordered snapshots; world sync fixes; permission-based joins)
  *
  * Design
  *  - Every client runs its OWN player, guns, techs and fields with the game's normal code.
@@ -59,6 +59,9 @@
         pvpScale: 0.01,
         syncCycle: true,     // keep simulation.cycle close to the host (moving platforms etc.)
         staleMs: 1500,       // no state packet for this long => treat peer as paused
+        maxMsgPerSec: 900,   // per peer; the normal rate is a few dozen packets per second
+        maxPeers: 12,
+        maxPktBytes: 9000,   // one state packet never exceeds this (roughly, JSON size); the least important parts are dropped first
         hostPauseMs: 500,    // a player must be paused this long before the host role moves away from them
         peerjsSrc: 'https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js',
     };
@@ -155,7 +158,7 @@
         const mobMap = new Map();       // netId -> mob
         const bodyMap = new Map();      // netId -> block
         const puMap = new Map();        // pid -> powerUp
-        let spawnQ = [], deathQ = [], opsQ = [], dropQ = [];
+        let spawnQ = [], deathQ = [], opsQ = [], dropQ = [], ownPuQ = [];
         let bodySnapshotSeen = null;
         const dmgOut = new Map();       // netId -> [dmg, pierce]
         let fxQ = [];                    // explosion visuals to mirror on the other players' screens
@@ -482,6 +485,7 @@
         function attach(c, outgoing) {
             const pid = c.peer; const slot = c.label === 'st' ? 'st' : 'ev';
             const initiator = outgoing ? S.id : pid; c._init = initiator;
+            if (!S.peers.has(pid) && S.peers.size >= CFG.maxPeers) { try { c.close(); } catch (e) { } return; }
             const p = S.peers.get(pid) || newPeer(pid);
             const cur = p[slot];
             const curDead = cur && cur._was && !cur.open;                          // opened once, closed since: not a real duplicate
@@ -597,7 +601,28 @@
 
         // ------------------------------------------------------------------ message handlers
         const H = {};
-        function onData(p, d) { if (!d || typeof d !== 'object') return; const f = H[d.t]; if (f) { S.netCtx = (S.netCtx | 0) + 1; try { f(p, d); } finally { S.netCtx--; } } }
+        // Every packet is untrusted: wrong shapes, oversized arrays/strings and floods are dropped before any handler sees them.
+        const MAXARR = 3000, MAXSTR = 20000;
+        function packetOk(d) {
+            if (typeof d.t !== 'string' || d.t.length > 12 || !Object.prototype.hasOwnProperty.call(H, d.t)) return false;
+            let n = 0;
+            for (const k in d) {
+                const v = d[k]; n++;
+                if (n > 40) return false;
+                if (typeof v === 'string') { if (v.length > MAXSTR) return false; }
+                else if (Array.isArray(v)) { if (v.length > MAXARR) return false; }
+                else if (typeof v === 'function') return false;
+            }
+            return true;
+        }
+        function onData(p, d) {
+            if (!d || typeof d !== 'object' || Array.isArray(d)) return;
+            const t = now();
+            if (!p._rl || t - p._rl.t0 > 1000) p._rl = { t0: t, n: 0, bad: p._rl ? p._rl.bad : 0 };
+            if (++p._rl.n > CFG.maxMsgPerSec) { if (p._rl.n === CFG.maxMsgPerSec + 1 && (errCount.flood = (errCount.flood | 0) + 1) <= 3) console.warn('[MP] flood from', p.name, '- dropping packets'); return; }
+            if (!packetOk(d)) { if ((p._rl.bad = (p._rl.bad | 0) + 1) > 200) { try { p.ev && p.ev.close(); } catch (e) { } } return; }
+            S.netCtx = (S.netCtx | 0) + 1; try { H[d.t](p, d); } finally { S.netCtx--; }
+        }
         const onDataSafe = guard('net.data', onData);
 
         H.hello = (p, d) => {
@@ -811,7 +836,7 @@
                     const bd = bodyMap.get(op[1]);
                     if (bd && (fromHost || S.isHost)) {
                         const owner = fromHost && typeof op[2] === 'string' ? op[2] : p.id;
-                        bd._owner = owner;
+                        bd._owner = owner; bd._ownAt = now();
                         if (S.isHost) relay.push(['c', op[1], owner]);
                     }
                 }
@@ -862,6 +887,36 @@
                 const before = powerUp.length;
                 S.replayDrop = true;
                 try { powerUps.directSpawn(x, y, e[0], true, (Number.isFinite(size) && size > 0) ? size : undefined); }
+                catch (er) { } finally { S.replayDrop = false; }
+                const pu = powerUp.length > before ? powerUp[powerUp.length - 1] : null;
+                if (pu && !finiteBody(pu)) dropBody(pu);
+            }
+        };
+        // ---- experimental mode: everybody builds in their own menu; the shared run only starts once everyone is done ----
+        H.exp = (p, d) => {
+            if (!S.peers.has(p.id) || typeof d.st !== 'string') return;
+            if (d.st === 'sel' || d.st === 'ready') p.exp = d.st; else if (d.st === 'go') p.exp = null;
+            expTryRelease();
+        };
+        function expTryRelease() {
+            if (!S.expWait) return;
+            const blockers = openPeers().filter(p => p.exp === 'sel');   // still choosing (a player in the build menu sends no game state)
+            if (blockers.length && now() - S.expWaitAt < 120000) { ui.banner('Ready - waiting for ' + blockers.map(p => p.name).join(', ') + ' to finish their build...'); return; }
+            const go = S.expWait; S.expWait = null; S.expSel = false; S.expReady = false;
+            try { ui.banner(null); } catch (e) { }
+            sendEv({ t: 'exp', st: 'go' });
+            try { go(); } catch (e) { console.warn('[MP] experimental start failed', e); }
+        }
+        H.po = (p, d) => {
+            if (!S.peers.has(p.id) || S.solo || S.loading || !S.inGame || (d.lc | 0) !== LC() || !Array.isArray(d.l) || p.dead) return;
+            const t = now(); if (!p._po || t - p._po.t > 1000) p._po = { t, n: 0 };
+            for (const e of d.l.slice(0, 30)) {
+                if (!Array.isArray(e) || ++p._po.n > 40) continue;
+                const x = Number(e[1]), y = Number(e[2]), size = Number(e[3]);
+                if (typeof e[0] !== 'string' || !powerUps[e[0]] || typeof powerUps[e[0]] !== 'object' || !Number.isFinite(x) || !Number.isFinite(y) || Math.abs(x) > 1e7 || Math.abs(y) > 1e7) continue;
+                const before = powerUp.length;
+                S.replayDrop = true;
+                try { powerUps.directSpawn(x, y, e[0], true, (Number.isFinite(size) && size > 0 && size < 500) ? size : undefined); }
                 catch (er) { } finally { S.replayDrop = false; }
                 const pu = powerUp.length > before ? powerUp[powerUp.length - 1] : null;
                 if (pu && !finiteBody(pu)) dropBody(pu);
@@ -1051,8 +1106,12 @@
         }
         // each physics step while eliminated: no shooting, follow a living teammate, stay unhurt
         Matter.Events.on(engine, 'beforeUpdate', guard('spectate', () => {
-            if (!S.dead) return;
+            if (!S.dead) {
+                if (S.specMask != null) { try { player.collisionFilter.mask = S.specMask; } catch (e) { } S.specMask = null; }
+                return;
+            }
             try { input.fire = false; input.field = false; } catch (e) { }
+            try { if (S.specMask == null) S.specMask = player.collisionFilter.mask; player.collisionFilter.mask = 0; } catch (e) { }   // a spectator does not collide with anything
             m.immuneCycle = m.cycle + 1e9;
             if (m.health > 0.01) m.health = 0.001;
             const live = livingOthers().filter(p => p.cur && Number.isFinite(p.cur.x)).sort((a, b) => a.id < b.id ? -1 : 1)[0];
@@ -1474,14 +1533,21 @@
                 });
             } else HOOKS['saveGame'] = false;
         }
+        function idHash(ids) {
+            const a = ids.slice().sort(); let h = 2166136261 >>> 0;
+            for (let i = 0; i < a.length; i++) { const t = a[i] + '|'; for (let j = 0; j < t.length; j++) { h ^= t.charCodeAt(j); h = Math.imul(h, 16777619) >>> 0; } }
+            return h;
+        }
         function sendMobRoster(to) {
             if (!S.isHost || !S.inGame || S.solo) return;
             const list = realMobs().filter(mo => mo.alive && mo._nid != null);
-            sendEv({ t: 'mc', lc: LC(), n: list.length, ids: list.map(mo => mo._nid), ol: String(level.onLevel) }, to);
+            const ids = list.map(mo => mo._nid);
+            // a roster of hundreds of ids would be ~10 KB: send the count and a hash of the sorted ids instead (ids themselves only while few)
+            sendEv({ t: 'mc', lc: LC(), n: ids.length, h: idHash(ids), ...(ids.length <= 30 ? { ids } : {}), ol: String(level.onLevel) }, to);
         }
         function resetSync() {
             mobMap.clear(); bodyMap.clear(); puMap.clear(); bodySnapshotSeen = null;
-            spawnQ = []; deathQ = []; opsQ = []; dropQ = []; fxQ = []; dmgOut.clear(); pvpOut.clear();
+            spawnQ = []; deathQ = []; opsQ = []; dropQ = []; ownPuQ = []; fxQ = []; dmgOut.clear(); pvpOut.clear();
             S.aliveIds = null; S.mc = null; S.ctr = 0; S.hostCy = null;
             S.buttons = []; S.buttonSeq = 0; S.buttonSent.clear(); S.remoteButtons.clear();
             S.mapIds = null; S.mapSent = new Map(); S.mapBase = new Map();
@@ -1524,7 +1590,7 @@
             const wanted = Array.isArray(S.mc.ids) ? S.mc.ids : null;
             const mismatch = wanted
                 ? (local.length !== wanted.length || wanted.some(id => !local.includes(id)))
-                : (local.length !== S.mc.n);
+                : (local.length !== S.mc.n || (Number.isFinite(S.mc.h) && idHash(local) !== S.mc.h));
             S.mc = null;
             if (mismatch) sendEv({ t: 'mreq', lc: LC() }, S.hostId);
         }
@@ -1655,7 +1721,7 @@
             if (simulation.cycle % 4) return;
             const targets = [];
             if (m.alive && !m.isCloak && !S.dead) targets.push(player.position);
-            for (const g of ghosts.values()) { const p = S.peers.get(g.gid); if (p && p.alive && !peerPaused(p) && g.position) targets.push(g.position); }
+            for (const g of ghosts.values()) { const p = S.peers.get(g.gid); if (p && p.alive && !p.dead && !peerPaused(p) && g.position) targets.push(g.position); }
             if (targets.length < 2) return;
             for (const mo of mob) {
                 if (!mo || mo.isGhost || !mo.alive || !mo.seePlayer || mo._puppet) continue;
@@ -1671,7 +1737,15 @@
             }
         }
         const doRetarget = guard('retarget', retarget);
-        const ensureDo = guard('ensureDo', () => { for (let i = 0; i < mob.length; i++) { const mo = mob[i]; if (mo && typeof mo.do !== 'function') mo.do = NOOP; } });
+        // Mob death runs in "mob phase": ephemera / effects it creates are the mob's own visuals (every client plays them from the death event),
+        // so they must not be tagged as the local player's effects and mirrored a second time.
+        function wrapMobDeath(mo) {
+            const d0 = mo.death;
+            if (typeof d0 !== 'function' || d0 === NOOP || mo._dw) return;
+            mo._dw = true;
+            mo.death = function () { S.mobPhase = (S.mobPhase | 0) + 1; try { return d0.apply(this, arguments); } finally { S.mobPhase--; } };
+        }
+        const ensureDo = guard('ensureDo', () => { for (let i = 0; i < mob.length; i++) { const mo = mob[i]; if (!mo) continue; if (typeof mo.do !== 'function') mo.do = NOOP; if (!mo._dw && !mo.isGhost && !mo._puppet) wrapMobDeath(mo); } });
         wrapFn(mobs, 'loop', 'mobs.loop', orig => function () {
             ensureDo();
             if (!S.isHost) { S.inPuppet = true; try { return orig.apply(this, arguments); } finally { S.inPuppet = false; } }
@@ -1724,7 +1798,19 @@
             Composite.add(engine.world, bd); body.push(bd); bodyMap.set(e[0], bd);
             return bd;
         }
-        function claim(bd) { bd._owner = S.id; opsQ.push(['c', bd._nid]); }
+        function claim(bd) { bd._owner = S.id; bd._ownAt = now(); opsQ.push(['c', bd._nid]); }
+        // pushing a block that somebody else owns: take it over the moment our body touches it (no need to grab it or wait for the proximity scan)
+        const claimOnTouch = guard('claimTouch', ev => {
+            if (!S.inGame || S.loading || S.solo || S.dead || S.applying || !hasPeers() || !player) return;
+            for (const pr of ev.pairs) {
+                const o = pr.bodyA === player ? pr.bodyB : (pr.bodyB === player ? pr.bodyA : null);
+                if (!o || o._nid === undefined || o._owner === S.id || o.isStatic || o._gone || o.isGhost || o.isNotHoldable) continue;
+                if (now() - (o._ownAt || 0) < 400) continue;                                   // two players leaning on one block must not fight over it every frame
+                claim(o);
+            }
+        });
+        Matter.Events.on(engine, 'collisionStart', claimOnTouch);
+        Matter.Events.on(engine, 'collisionActive', claimOnTouch);
         function applyBlocks(p, list) {
             if (!Array.isArray(list)) return;
             const fromHost = isHostPeer(p);
@@ -1853,10 +1939,13 @@
         const VM_COMP = new Set(['source-over', 'lighter', 'multiply', 'screen', 'overlay', 'destination-out', 'source-atop', 'xor', 'difference', 'darken', 'lighten']);
         const VM_CAP = new Set(['butt', 'round', 'square']), VM_JOIN = new Set(['miter', 'round', 'bevel']);
         const VM_ARGS = { B: 0, Z: 0, M: 2, L: 2, A: 6, E: 8, Q: 4, C: 6, R: 4, T: 5, F: 0, S: 0, P: 4, O: 4, V: 0, W: 0, X: 2, Y: 1, D: 2, U: 6, K: 0, a: 1, e: 1, h: 1, J: 1, l: 1 };
+        function vmStr(code, args, prec) {
+            let s = code; if (args) { for (let i = 0; i < args.length; i++) s += (i ? ',' : '') + (typeof args[i] === 'string' ? args[i] : vmNum(args[i], prec == null ? 1 : prec)); }
+            return s;
+        }
         function vmRec(code, args, prec) {
             const c = VM.cur; if (!c || c.ops.length > 5000) return;
-            let s = code; if (args) { for (let i = 0; i < args.length; i++) s += (i ? ',' : '') + (typeof args[i] === 'string' ? args[i] : vmNum(args[i], prec == null ? 1 : prec)); }
-            c.ops.push(s);
+            c.ops.push(vmStr(code, args, prec));
         }
         function installRecorder() {
             if (ctx._mpRec) return; ctx._mpRec = true;
@@ -1885,9 +1974,16 @@
                 const orig = ctx[name]; if (typeof orig !== 'function') return;
                 ctx[name] = function () {
                     const g = orig.apply(ctx, arguments);
-                    if (VM.cur && g) {
-                        g._vid = ++VM.grads; vmRec(code, [g._vid, ...arguments], 1);
-                        const add = g.addColorStop; g.addColorStop = function (o, col) { if (VM.cur) vmRec('s', [g._vid, vmNum(o, 3), vmCol(col)]); return add.call(g, o, col); };
+                    if (g) {
+                        g._vid = (VM.grads = (VM.grads + 1) % 1000000) + 1;
+                        const args = [g._vid, ...arguments];
+                        g._def = [vmStr(code, args, 1)];                                   // remembered, so a gradient made OUTSIDE a recorded phase (m.bodyGradient) can still be sent
+                        if (VM.cur) { VM.cur.ops.push(g._def[0]); (VM.cur.em || (VM.cur.em = new Set())).add(g._vid); }
+                        const add = g.addColorStop;
+                        g.addColorStop = function (o, col) {
+                            try { const st = vmStr('s', [g._vid, vmNum(o, 3), vmCol(col)]); if (g._def.length < 12) g._def.push(st); if (VM.cur && VM.cur.em && VM.cur.em.has(g._vid)) VM.cur.ops.push(st); } catch (e) { }
+                            return add.call(g, o, col);
+                        };
                     }
                     return g;
                 };
@@ -1900,7 +1996,11 @@
                     get() { return d.get.call(ctx); },
                     set(v) {
                         if (VM.cur) {
-                            if (kind === 'col') { if (typeof v === 'string') vmRec(code, [vmCol(v)]); else if (v && v._vid) vmRec(code, ['@' + v._vid]); }
+                            if (kind === 'col') { if (typeof v === 'string') vmRec(code, [vmCol(v)]); else if (v && v._vid) {
+                                const c = VM.cur;
+                                if (v._def && !(c.em && c.em.has(v._vid))) { for (const d of v._def) c.ops.push(d); (c.em || (c.em = new Set())).add(v._vid); }
+                                vmRec(code, ['@' + v._vid]);
+                            } }
                             else if (kind === 'str') vmRec(code, [String(v).replace(/[;,]/g, '')]);
                             else vmRec(code, [v], 3);
                         }
@@ -1918,7 +2018,19 @@
         }
         function vmEnd() {
             const c = VM.cur; VM.cur = null; if (!c) return;
-            if (c.ops.length && !VM.bad) VM.latest.set(c.key, { k: c.kind, ax: c.ax, ay: c.ay, vx: c.vx, vy: c.vy, s: c.ops.join(';'), f: VM.frame });
+            if (c.ops.length && !VM.bad) {
+                const str = c.ops.join(';'), prev = VM.latest.get(c.key);
+                // A one-frame flash can be overwritten by the next, plainer frame before the next 20 Hz packet leaves. Remember the
+                // most elaborate drawing since the last packet and send it as a short "flash" group as well.
+                let pk = null;
+                if (prev && prev.f >= VM.sentFrame) {
+                    pk = prev.pk;
+                    const cand = prev.s, cur = pk ? pk.s : null;
+                    if (cand.length > str.length * 1.3 + 60 && (!cur || cand.length > cur.length)) pk = { s: cand, ax: prev.ax, ay: prev.ay, vx: prev.vx, vy: prev.vy };
+                    else if (str.length > cand.length * 1.3 + 60 && (!cur || str.length > cur.length)) pk = { s: str, ax: c.ax, ay: c.ay, vx: c.vx, vy: c.vy };
+                }
+                VM.latest.set(c.key, { k: c.kind, ax: c.ax, ay: c.ay, vx: c.vx, vy: c.vy, s: str, f: VM.frame, pk });
+            }
         }
         function vmPhase(obj, key, gkey, kind) {
             if (!obj || typeof obj[key] !== 'function') { HOOKS['vm.' + gkey] = false; return; }
@@ -1935,6 +2047,7 @@
         }
         function installPhases() {
             vmPhase(m, 'hold', 'hold', 0);
+            vmPhase(m, 'draw', 'skin', 0);                 // the player's real body / legs / skin, whatever skin or tech changed it
             vmPhase(b, 'fire', 'fire', 0);
             // per-bullet groups (own velocity => smooth extrapolation on the other screens)
             const rawBD = b.bulletDo;
@@ -2000,6 +2113,11 @@
                 if (size + g.s.length > 9000) break;
                 size += g.s.length + 40;
                 out.push([g.k, k, q(g.ax, 10) / 10, q(g.ay, 10) / 10, q(g.vx, 100) / 100, q(g.vy, 100) / 100, g.s]);
+                if (g.pk && g.f >= VM.sentFrame && size + g.pk.s.length < 9000) {                      // flash group: kind 10 + original kind
+                    size += g.pk.s.length + 40;
+                    out.push([10 + g.k, k + '*', q(g.pk.ax, 10) / 10, q(g.pk.ay, 10) / 10, q(g.pk.vx, 100) / 100, q(g.pk.vy, 100) / 100, g.pk.s]);
+                }
+                g.pk = null;
             }
             VM.sentFrame = VM.frame + 1;
             for (const [k, g] of VM.latest) if (g.f < VM.frame - 40) VM.latest.delete(k);
@@ -2072,11 +2190,15 @@
             }
             while (depth-- > 0) ctx.restore();
         }
+        const hasSkinVm = p => !!(p.vm && now() - p.vm.at < 250 && p.vm.g.some(g => g.key === 'skin'));
         function drawVm(p) {
             const vm = p.vm; if (!vm || !vm.g.length || now() - vm.at > 250 || VM.cur) return;
             const cur = p.cur;
             const fr = Math.max(-9, Math.min(8, (now() - CFG.interpMs - (Number.isFinite(vm.t) ? vm.t : vm.at)) / stepMs()));
-            for (const g of vm.g) {
+            for (const g0 of vm.g) {
+                const flash = g0.k >= 10;
+                if (flash && now() - vm.at > 110) continue;                                          // flashes are shown briefly, once
+                const g = flash ? { ...g0, k: g0.k - 10 } : g0;
                 let dx = 0, dy = 0;
                 if (g.k === 0) { if (!cur) continue; if (g.key === 'hold' && p.fm === 7) continue; dx = cur.x - g.ax; dy = cur.y - g.ay; }   // cloaking: its big white circle is a view effect for the owner only
                 else if (g.k === 1) { dx = g.vx * fr; dy = g.vy * fr; }
@@ -2163,7 +2285,8 @@
                     ctx.beginPath(); ctx.arc(s.x, s.y, Math.max(40, pp.fr || 120), 0, 2 * Math.PI);
                     ctx.fillStyle = 'rgba(0,170,255,0.10)'; ctx.fill(); ctx.strokeStyle = 'rgba(0,170,255,0.35)'; ctx.lineWidth = 2; ctx.stroke();
                 }
-                drawRemotePlayer(pp, s, this._flash > 0);
+                if (hasSkinVm(pp)) { if (this._flash > 0) { ctx.beginPath(); ctx.arc(s.x, s.y, 32, 0, 2 * Math.PI); ctx.fillStyle = 'rgba(255,60,60,0.35)'; ctx.fill(); } }
+                else drawRemotePlayer(pp, s, this._flash > 0);
                 if (this._flash > 0) this._flash--;
                 const w = 60, hp = Math.max(0, Math.min(1, (pp.hp || 0) / Math.max(0.0001, pp.mhp || 1)));
                 ctx.fillStyle = 'rgba(100,100,100,0.4)'; ctx.fillRect(s.x - w / 2, s.y - 55, w, 6);
@@ -2182,7 +2305,7 @@
         function destroyGhosts() { for (const id of [...ghosts.keys()]) removeGhost(id); }
         function maintainGhosts() {
             for (const p of S.peers.values()) {
-                const want = S.inGame && !S.loading && !S.solo && p.buf.length && p.lc === LC();
+                const want = S.inGame && !S.loading && !S.solo && p.buf.length && p.lc === LC() && !p.dead;   // a spectator has no body at all: no collisions, no effects, no ray blocking
                 if (want && !ghosts.has(p.id)) makeGhost(p);
                 else if (!want && ghosts.has(p.id)) removeGhost(p.id);
             }
@@ -2286,6 +2409,30 @@
             }
             return out;
         }
+        // keep every state packet small: drop the least important parts first and make sure dropped bodies / mobs are re-sent next tick
+        const jlen = v => { try { return JSON.stringify(v).length; } catch (e) { return 0; } };
+        function enforcePktBudget(pkt) {
+            const cap = CFG.maxPktBytes;
+            let total = jlen(pkt); if (total <= cap) return;
+            S.pktTrim = (S.pktTrim | 0) + 1;
+            const shrink = (key, minKeep, onDrop, stride) => {
+                stride = stride || 1;
+                const a = pkt[key]; if (!Array.isArray(a)) return;
+                while (total > cap && a.length > minKeep) {
+                    const keep = Math.max(minKeep, Math.floor(a.length / 2 / stride) * stride);
+                    const dropped = a.splice(keep);
+                    if (onDrop) for (const e of dropped) onDrop(e);
+                    total = jlen(pkt);
+                }
+                if (!a.length) delete pkt[key];
+            };
+            shrink('vm', 0);                                                                  // mirrored drawings are cosmetic
+            if (total > cap && pkt.bp) { delete pkt.bp; total = jlen(pkt); }                  // exact bullet polygons are cosmetic too
+            shrink('bl', 16, null, 8);                                                        // then far bullets (8 numbers each)
+            shrink('bk', 4, e => { const bd = bodyMap.get(e[0]); if (bd) { bd._mpLast = null; bd._rest = false; } });
+            shrink('mo', 8, e => { const mb = mobMap.get(e[0]); if (mb) mb._ls = null; });
+            shrink('mm', 0);
+        }
         function sendState() {
             const pkt = { t: 's', lc: LC(), ep: S.epoch, sq: ++S.sendSeq, ts: Math.round(now() * 10) / 10, p: localPlayer(), bl: bulletSnap() };
             { const vms = VM.active ? vmSnap() : []; if (vms.length) pkt.vm = vms; }
@@ -2313,24 +2460,30 @@
                 pkt.cy = simulation.cycle; pkt.fi = simulation.fpsInterval;
                 const mm = scanMapMovers(); if (mm && mm.length) pkt.mm = mm;
                 const mo = [];
-                for (const mb of mob) {
+                const nm = mob.length, start = nm ? (S.moRot | 0) % nm : 0; let stopAt = -1;
+                for (let ii = 0; ii < nm; ii++) {                                          // rotating start: when there are too many to fit, everyone still gets their turn
+                    const mb = mob[(start + ii) % nm];
                     if (!mb || mb.isGhost || mb._nid === undefined || !mb.alive) continue;
                     const x = q(mb.position.x), y = q(mb.position.y), hp = q(mb.health, 1000), l = mb._ls;
                     if (!l || Math.abs(l[0] - x) + Math.abs(l[1] - y) > 1 || l[2] !== hp || S.tickN % 20 === 0) {
                         mo.push([mb._nid, x, y, q(mb.velocity.x, 100), q(mb.velocity.y, 100), q(mb.angle, 1000), hp]); mb._ls = [x, y, hp];
                     }
-                    if (mo.length >= 300) break;
+                    if (mo.length >= 110) { stopAt = (start + ii + 1) % nm; break; }
                 }
+                S.moRot = stopAt >= 0 ? stopAt : 0;
                 if (mo.length) pkt.mo = mo;
             }
+            enforcePktBudget(pkt);
             sendSt(pkt);
         }
         function flush() {
             const lc = LC();
-            if (spawnQ.length) { sendEv({ t: 'sp', lc, l: spawnQ }); spawnQ = []; }
-            if (deathQ.length) { sendEv({ t: 'md', lc, l: deathQ }); deathQ = []; }
-            if (opsQ.length) { sendEv({ t: 'bk', lc, l: opsQ }); opsQ = []; }
-            if (dropQ.length) { sendEv({ t: 'pd', lc, l: dropQ }); dropQ = []; }
+            const sendChunks = (t, list, n) => { for (let i = 0; i < list.length; i += n) sendEv({ t, lc, l: list.slice(i, i + n) }); };   // keep every reliable packet small
+            if (spawnQ.length) { sendChunks('sp', spawnQ, 60); spawnQ = []; }
+            if (deathQ.length) { sendChunks('md', deathQ, 200); deathQ = []; }
+            if (opsQ.length) { sendChunks('bk', opsQ, 60); opsQ = []; }
+            if (dropQ.length) { sendChunks('pd', dropQ, 100); dropQ = []; }
+            if (ownPuQ.length) { sendChunks('po', ownPuQ.slice(-30), 30); ownPuQ = []; }
             if (dmgOut.size) {
                 const l = []; for (const [id, e] of dmgOut) l.push([id, e[0], e[1]]);
                 dmgOut.clear(); sendEv({ t: 'dm', lc, l, q: ++S.dmgSeq }, S.hostId);
@@ -2361,10 +2514,29 @@
             if (Math.abs(diff) > 30) simulation.cycle = Math.round(exp);
             else if (Math.abs(diff) > 6) simulation.cycle += Math.sign(diff);
         }
+        // Long sessions: drop bookkeeping for things the game has already removed, and delete physics bodies whose numbers went bad.
+        function pruneState() {
+            for (const [id, mo] of mobMap) if (!mo || !mo.alive || mob.indexOf(mo) === -1) mobMap.delete(id);
+            for (const [id, pu] of puMap) if (!pu || powerUp.indexOf(pu) === -1) puMap.delete(id);
+            for (const [id, bd] of bodyMap) if (!bd || bd._gone || (bd.position && !finiteBody(bd))) bodyMap.delete(id);
+            for (const [id, g] of ghosts) if (!S.peers.has(id)) removeGhost(id);                       // ghost whose peer is gone
+            for (const [id, g] of ghosts) if (!g.position || !Number.isFinite(g.position.x) || !Number.isFinite(g.position.y)) removeGhost(id);
+            for (const bd of body.slice()) {                                                           // invalid bodies would poison the physics step for everybody
+                if (bd && bd.position && !finiteBody(bd)) {
+                    try { Matter.Composite.remove(engine.world, bd); } catch (e) { }
+                    const i = body.indexOf(bd); if (i !== -1) body.splice(i, 1);
+                    errCount.badBody = (errCount.badBody | 0) + 1;
+                }
+            }
+            for (const p of S.peers.values()) if (p.buf && p.buf.length > 10) p.buf.splice(0, p.buf.length - 10);
+            for (const [k, v] of dmgOut) if (!v) dmgOut.delete(k);
+            if (dir.size > 200) { const keep = [...dir].slice(-200); dir.clear(); for (const [k, v] of keep) dir.set(k, v); }
+        }
         function tick() {
             S.tickN++;
             try {
                 updatePaused();
+                if (S.expWait) expTryRelease();
                 levelWatch();
                 checkAllDown();
                 try { sweepStrays(); } catch (e) { }
@@ -2372,7 +2544,8 @@
                 wrapSpawns();
                 if (S.tickN % 4 === 0 && S.id && computeHost() !== S.hostId) refreshRole();   // hand the host role to / back from an active player
                 maintainGhosts(); checkMc(); runCatchup();
-                if (!hasPeers()) { opsQ = []; dropQ = []; spawnQ = []; deathQ = []; dmgOut.clear(); pvpOut.clear(); mfxQ = []; impOut.clear(); scanWorld(); return; }
+                if (S.tickN % 150 === 0) pruneState();
+                if (!hasPeers()) { opsQ = []; dropQ = []; ownPuQ = []; spawnQ = []; deathQ = []; dmgOut.clear(); pvpOut.clear(); mfxQ = []; impOut.clear(); scanWorld(); return; }
                 syncCycle();
                 scanWorld(); flush(); sendState();
                 if (S.isHost && hasPeers() && !S.paused) {
@@ -2577,10 +2750,18 @@
             const pu = powerUp[powerUp.length - 1];
             if (pu && pu.position) dropQ.push([String(name), q(pu.position.x), q(pu.position.y), q(pu.size)]);
         });
+        // Pickups made by a player's OWN code (techs, fields, healing overflow...) are shared too: every other client spawns its own copy.
+        const recordOwnSpawn = guard('po.record', (name, before) => {
+            if (powerUp.length <= before || S.dropCtx > 0 || S.replayDrop || S.netCtx > 0 || S.levelPhase > 0 || S.mobPhase > 0) return;
+            if (!S.inGame || S.loading || S.solo || S.applying || S.dead || !hasPeers() || ownPuQ.length > 60) return;
+            const pu = powerUp[powerUp.length - 1];
+            if (pu && pu.position) ownPuQ.push([String(name), q(pu.position.x), q(pu.position.y), q(pu.size)]);
+        });
         wrapFn(powerUps, 'directSpawn', 'powerUps.directSpawn', orig => function (x, y, name) {
             const before = powerUp.length;
             const r = orig.apply(this, arguments);
             recordDrop(name, before);
+            recordOwnSpawn(name, before);
             return r;
         });
         wrapSpawns();
@@ -2592,6 +2773,22 @@
         wrapPopulateLevels();
         wrapLevelFrameRandom();
         wrapNewFeatures();
+        if (typeof build !== 'undefined' && build) {
+            wrapFn(build, 'reset', 'build.reset', orig => function () {
+                const r = orig.apply(this, arguments);
+                Promise.resolve(r).then(() => { if (S.inGame && !S.solo && hasPeers() && !S.expWait) { S.expSel = true; S.expReady = false; sendEv({ t: 'exp', st: 'sel' }); } }).catch(() => { });
+                return r;
+            });
+            wrapFn(build, 'startExperiment', 'build.startExperiment', orig => function () {
+                if (S.expWait) return undefined;
+                if (!S.expSel || S.solo || !S.inGame || !hasPeers() || S.applying) { if (S.expSel) { S.expSel = false; sendEv({ t: 'exp', st: 'go' }); } return orig.apply(this, arguments); }
+                S.expReady = true; sendEv({ t: 'exp', st: 'ready' });
+                const self = this, args = arguments;
+                S.expWait = () => orig.apply(self, args); S.expWaitAt = now();
+                expTryRelease();
+                return undefined;
+            });
+        } else HOOKS['build'] = false;
         wrapDeath();
         // explosions: n-gon draws them through simulation.drawList; copy exactly what an explosion drew so everybody sees it
         if (typeof b !== 'undefined' && b && typeof b.explosion === 'function') {
