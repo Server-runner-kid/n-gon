@@ -1,5 +1,5 @@
 /*
- * n-gon multiplayer v10-J (cloak flash, blend modes, host-authoritative difficulty, guest experiment scroll; spectator camera, gravity-flip buttons, host room settings, panel UI; triangle bullets sent as real polygons; flash frames, shared self-spawned pickups, experimental ready gate, 9 KB packet budget, hashed mob roster; spectators removed from the world, real skins mirrored, no duplicate mob-death visuals, touch-to-claim blocks; F stability: packet validation/rate limits/chunking, pruning, invalid-body cleanup; visual mirror, guest mob effects, printed flag, real bullet shapes, cloak fix, spectators non-solid, pilot wave claim, shared experimental mode) / v9-E  (v9-D + match management: host-authoritative level changes, reconnect/late-join parity, duplicate-connection fix, training isolation; combat sync: duplicate-damage guards, mirrored explosions, bullets on the ghost time base, field/immunity visuals; elimination + revival; ordered snapshots; world sync fixes; permission-based joins)
+ * n-gon multiplayer v10-M (title-screen lobby play, community-maps option; v10-L: exit match, save and load whole matches, timers survive title return; v10-K: attack timing, hit particles, single corpse, own choices, companions, host-only start; v10-J: cloak flash, blend modes, host-authoritative difficulty, guest experiment scroll; spectator camera, gravity-flip buttons, host room settings, panel UI; triangle bullets sent as real polygons; flash frames, shared self-spawned pickups, experimental ready gate, 9 KB packet budget, hashed mob roster; spectators removed from the world, real skins mirrored, no duplicate mob-death visuals, touch-to-claim blocks; F stability: packet validation/rate limits/chunking, pruning, invalid-body cleanup; visual mirror, guest mob effects, printed flag, real bullet shapes, cloak fix, spectators non-solid, pilot wave claim, shared experimental mode) / v9-E  (v9-D + match management: host-authoritative level changes, reconnect/late-join parity, duplicate-connection fix, training isolation; combat sync: duplicate-damage guards, mirrored explosions, bullets on the ghost time base, field/immunity visuals; elimination + revival; ordered snapshots; world sync fixes; permission-based joins)
  *
  * Design
  *  - Every client runs its OWN player, guns, techs and fields with the game's normal code.
@@ -48,6 +48,12 @@
  */
 (function () {
     'use strict';
+    // n-gon's simulation.clearTimeouts() cancels EVERY timer on the page (when a run ends, on rewind...). The multiplayer's own timers
+    // (connection checks, player list, heartbeats) must survive that, or the lobby silently dies after the first death.
+    const PROT = new Set();
+    const rawSetTimeout = window.setTimeout.bind(window), rawSetInterval = window.setInterval.bind(window);
+    const setTimeout = function (f, ms, ...a) { let id; id = rawSetTimeout(function () { PROT.delete(id); return typeof f === 'function' ? f.apply(this, a) : undefined; }, ms); PROT.add(id); return id; };
+    const setInterval = function (f, ms, ...a) { const id = rawSetInterval(f, ms, ...a); PROT.add(id); return id; };
     if (window.__ngonMP) return;
     window.__ngonMP = true;
 
@@ -66,7 +72,7 @@
         peerjsSrc: 'https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js',
     };
     const NOOP = function () { };
-    const SKIP_SPAWN = /^(mapRect|mapVertex|mapRectNow|mapVertexNow|bodyRect|bodyVertex|bodyRectCorner|debris|pickList|fullPickList|setMobTypeSpawnOrder|setSpawnList|randomizeSpawnList|dmg\w*|mobDmg\w*|props\w*|spawnBuilding|spawnStairs|addResearchToLevel|sandPaper)$/;
+    const SKIP_SPAWN = /^(mapRect|mapVertex|mapRectNow|mapVertexNow|bodyRect|bodyVertex|body\w*|\w+Vector|spawnChance|allowedPickList|debris|pickList|fullPickList|setMobTypeSpawnOrder|setSpawnList|randomizeSpawnList|dmg\w*|mobDmg\w*|props\w*|spawnBuilding|spawnStairs|addResearchToLevel|sandPaper)$/;
     const PUPPET_NOOPS = ['locatePlayer', 'seePlayerCheck', 'seePlayerByLookingAt', 'seePlayerByHistory', 'seePlayerCheckByDistance', 'seePlayerByDistOrLOS', 'alwaysSeePlayer', 'alertNearByMobs', 'attraction', 'repulsion', 'gravity'];
 
     // ---- helpers (NOTE: never use Math.random here, n-gon seeds it and we must not disturb the RNG) ----
@@ -140,7 +146,7 @@
             id: null, hostId: null, sessionHostId: null, isHost: true,
             name: localStorage.getItem('p2pUsername') || 'player',
             peers: new Map(),
-            together: true, pvp: false, room: { max: 8, ask: true },
+            together: true, pvp: false, room: { max: 8, ask: true, gun: true },
             forceLocalNext: false, hostAction: false, lvlReqLc: -1, lvlReqAt: 0,
             inGame: false, loading: false, applying: false, replay: false, inPuppet: false,
             replayNew: [], grp: 0, ctr: 0, tickN: 0,
@@ -683,11 +689,13 @@
         H.seed = (p, d) => { if (isHostPeer(p) && !S.inGame && d.seed != null) setSeed(String(d.seed)); };
         // Only the deterministic lobby leader may start a shared run.
         H.startReq = (p, d) => {
+            return;   // only the host starts a run
             if (!S.isHost || S.inGame || S.loading || S.starting) return;
             if (d && d.exp && typeof build !== 'undefined' && typeof build.reset === 'function') { try { openBuildMenu(); } catch (e) { simulation.startGame(); } return; }   // experimental mode: everyone opens their own build menu
             simulation.startGame();
         };
         H.start = (p, d) => {
+            S.matchLoaded = false;
             if (!isHostPeer(p) || S.inGame || S.loading || S.starting || d.seed == null) return;
             S.runSeed = String(d.seed);
             beginRun(S.runSeed, d.lv, d.fl, d.df, !!d.exp);
@@ -717,7 +725,7 @@
                 const x = Number(e[0]), y = Number(e[1]), r = Number(e[2]), col = e[3];
                 if (![x, y, r].every(Number.isFinite) || r <= 0 || r > 3000 || Math.abs(x) > 1e7 || Math.abs(y) > 1e7) continue;
                 if (typeof col !== 'string' || col.length > 48 || !/^rgba?\([0-9., %]+\)$|^#[0-9a-fA-F]{3,8}$/.test(col)) continue;
-                try { simulation.drawList.push({ x, y, radius: r, color: col, time: simulation.drawTime }); } catch (er) { }   // visual only: damage is decided by the owner
+                try { simulation.drawList.push({ x, y, radius: r, color: col, time: simulation.drawTime, _mp: true }); } catch (er) { }   // visual only: damage is decided by the owner
             }
         };
         H.chat = (p, d) => say(esc(p.name) + ': ' + esc(String(d.x || '').slice(0, 200)), true);
@@ -739,6 +747,8 @@
         };
         H.resync = (p, d) => {            // host checkpoint/level mismatch: rebuild even if this client was already in a run
             if (!isHostPeer(p) || S.solo || d.seed == null || !Number.isFinite(Number(d.lc))) return;
+            if (S.guestLoad || S.savePending && !S.isHost) return;                          // this player is loading its own save from the match file
+            if (S.matchLoaded && S.inGame && LC() === (d.lc | 0)) return;                    // already on the right level with its own loadout: a rebuild would erase it
             S.runSeed = String(d.seed); S.catchTarget = Math.max(0, d.lc | 0);
             if (S.inGame) {
                 S.forceLv = Array.isArray(d.lv) ? d.lv.map(String).slice(0, 64) : null;
@@ -785,6 +795,7 @@
                 const mo = mobMap.get(id); mobMap.delete(id);
                 if (!mo || !mo.alive) continue;
                 mo.isDropPowerUp = false;
+                mo.leaveBody = false;                                   // the corpse block comes from the host (synced); making another here would give two
                 S.inPuppet = true;
                 try { (mo._realDeath || mo.death).call(mo); } catch (e) { } finally { S.inPuppet = false; }
                 if (mo.alive) killSilently(mo);
@@ -917,9 +928,21 @@
         // The title screen's experiment button does more than build.reset(): it hides the title buttons, shows the grid and turns page scrolling on.
         // A guest that skipped all that could not scroll the selection screen. Use the real thing.
         function openBuildMenu() {
-            if (typeof openExperimentMenu === 'function') return openExperimentMenu();
-            return build.reset();
+            S.allowExpMenu = true;
+            try { if (typeof openExperimentMenu === 'function') return openExperimentMenu(); return build.reset(); }
+            finally { S.allowExpMenu = false; }
         }
+        // a guest cannot open the experimental setup on its own: the host decides when the run (and the setup) starts
+        try {
+            if (typeof openExperimentMenu === 'function' && !openExperimentMenu._mpw) {
+                const oem = openExperimentMenu;
+                const w = function () {
+                    if (!S.allowExpMenu && !S.inGame && hasPeers() && !S.isHost) { try { ui.banner('Only the host can start the run.'); setTimeout(() => ui.banner(null), 2500); } catch (e) { } return; }
+                    return oem.apply(this, arguments);
+                };
+                w._mpw = true; window.openExperimentMenu = w;
+            }
+        } catch (e) { console.warn('[MP] openExperimentMenu hook', e); }
         H.exp = (p, d) => {
             if (!S.peers.has(p.id) || typeof d.st !== 'string') return;
             if (d.st === 'sel' || d.st === 'ready') p.exp = d.st; else if (d.st === 'go') p.exp = null;
@@ -953,16 +976,35 @@
                 level.updateDifficulty();
                 if (initial.isConstraint !== sel.isConstraint || initial.isStrongerConstraints !== sel.isStrongerConstraints) level.setConstraints();
                 lore.setTechGoal();
+                if (level.levelsCleared === 0) {                                   // same as n-gon's own confirm: the first pickups are rolled again under the new rules
+                    for (const item of powerUp) Matter.Composite.remove(engine.world, item);
+                    powerUp.length = 0;
+                    level.initialPowerUps();
+                    try { simulation.trails(30); } catch (e) { }
+                }
                 try { ui.banner('The host changed the difficulty.'); setTimeout(() => ui.banner(null), 3000); } catch (e) { }
             } catch (e) { console.warn('[MP] applyDifficulty', e); }
             finally { S.diffApplying = false; }
         }
         H.diff = (p, d) => { if (!isHostPeer(p) || S.isHost || S.solo || !S.inGame) return; applyDifficulty(d.o); };
         H.name = (p, d) => { if (!S.peers.has(p.id)) return; const n = cleanName(d.name); if (n) { p.name = n; ui.refresh(); } };
-        function sendRoom(to) { sendEv({ t: 'room', pvp: S.pvp ? 1 : 0, tg: S.together ? 1 : 0, max: S.room.max, ask: S.room.ask ? 1 : 0 }, to); }
+        const communityOn = () => { try { return !!(typeof localSettings === 'object' && localSettings && localSettings.isCommunityMaps); } catch (e) { return false; } };
+        function setCommunity(on) {
+            try {
+                const names = (typeof level !== 'undefined' && Array.isArray(level.communityLevels)) ? level.communityLevels : null;
+                if (!names || typeof localSettings !== 'object' || !localSettings.levelPool) return false;
+                const lp = localSettings.levelPool;
+                const rest = (lp.added || []).filter(n => !names.includes(n));
+                lp.added = on ? rest.concat(names.filter(n => !(lp.banned || []).includes(n))) : rest;
+                if (typeof levelPoolMenu !== 'undefined' && levelPoolMenu && typeof levelPoolMenu.update === 'function') levelPoolMenu.update();
+                else { localSettings.isCommunityMaps = on; simulation.isCommunityMaps = on; try { localStorage.setItem('localSettings', JSON.stringify(localSettings)); } catch (e) { } }
+                return true;
+            } catch (e) { console.warn('[MP] community maps', e); return false; }
+        }
+        function sendRoom(to) { sendEv({ t: 'room', pvp: S.pvp ? 1 : 0, tg: S.together ? 1 : 0, max: S.room.max, ask: S.room.ask ? 1 : 0, gun: S.room.gun ? 1 : 0, comm: communityOn() ? 1 : 0 }, to); }
         H.room = (p, d) => {
             if (!S.peers.has(p.id) || S.isHost || !isHostPeer(p)) return;                    // only the host decides the room settings
-            S.pvp = d.pvp === 1; S.together = d.tg !== 0; S.room.ask = d.ask !== 0; S.room.max = Math.max(2, Math.min(12, d.max | 0 || 8));
+            S.pvp = d.pvp === 1; S.together = d.tg !== 0; S.room.ask = d.ask !== 0; S.room.max = Math.max(2, Math.min(12, d.max | 0 || 8)); S.room.gun = d.gun !== 0; S.room.comm = d.comm === 1;
             ui.refresh();
         };
         H.po = (p, d) => {
@@ -1013,6 +1055,9 @@
             p.blAt = now();
             p.vm = (d.lc === LC() && !S.loading) ? vmParse(d.vm, st) : null;
             p.bp = (d.lc === LC() && Array.isArray(d.bp) && d.bp.length < 2500) ? d.bp.map(v => Number.isFinite(v) ? v : 0) : null;
+            // short history of what this player's attacks looked like, so they are drawn at the same moment as the (delayed) ghost: a new bullet
+            // then appears at the muzzle instead of being extrapolated backwards behind the shooter
+            { const h = p.hist || (p.hist = []); h.push({ t: st, bl: p.bl, bp: p.bp, vm: p.vm }); while (h.length > 14 || (h.length > 2 && h[0].t < st - 900)) h.shift(); }
             const fromHost = isHostPeer(p);
             if (d.cy != null && fromHost && !S.isHost && !p.paused) S.hostCy = { cy: Number(d.cy), t: now(), lc: p.lc, fi: d.fi };
             if (p.lc !== LC() || S.loading) return;
@@ -1062,13 +1107,19 @@
         function wrapDeath() {
             wrapFn(m, 'death', 'm.death', orig => function () {
                 if (S.dead && !S.forceDeath) return undefined;                    // already eliminated; stray damage must not end the run
+                if (!S.forceDeath && !S.dead && S.inGame && !S.solo && hasPeers() && !simulation.isTraining && (S.loading || simulation.clearNow || (S.lvGraceUntil && now() < S.lvGraceUntil))) {
+                    // a hit that lands while the level is being swapped (or in the first moments of the new one) is a leftover from the OLD level: it must never end the run
+                    S.lvSaved = (S.lvSaved || 0) + 1;
+                    try { if (m.health <= 0) { m.health = Math.max(0.05, m.maxHealth * 0.25); m.displayHealth(); } } catch (e) { }
+                    return undefined;
+                }
                 let elim = false;
                 try { elim = canEliminate(); } catch (e) { elim = false; }
                 if (elim) { eliminate(); return undefined; }
                 if (S.dead) { S.dead = false; }
                 return orig.apply(this, arguments);
             });
-            wrapFn(m, 'takeDamage', 'm.takeDamage', orig => function () { if (S.dead) return undefined; return orig.apply(this, arguments); });
+            wrapFn(m, 'takeDamage', 'm.takeDamage', orig => function () { if (S.dead) return undefined; if (S.inGame && !S.solo && !S.dead && hasPeers() && (S.loading || simulation.clearNow)) return undefined; return orig.apply(this, arguments); });
             // an eliminated player cannot advance the level by standing in the exit
             // Level changes are decided by the HOST. A guest that reaches an exit only asks; the host changes level and everybody (the asking
             // guest included) follows its 'lvl' message, so two players can never end up on different levels because of racing exits.
@@ -1303,7 +1354,7 @@
             if (loadingSave) S.saveStarted = true;
             // A guest asks the lobby leader to start; it never starts a divergent local run.
             if (!S.applying && hasPeers() && !S.isHost && !loadingSave) {
-                sendEv({ t: 'startReq', exp: isBuildRun ? 1 : 0 }, S.hostId);
+                try { ui.banner('Only the host can start the run.'); setTimeout(() => ui.banner(null), 2500); } catch (e) { }
                 return;
             }
             let announce = false;
@@ -1372,7 +1423,7 @@
             }
         });
         wrapFn(simulation, 'clearMap', 'simulation.clearMap', orig => function () { onClearPre(); return orig.apply(this, arguments); });
-        const onLevelStart = guard('level.start.post', () => { S.levelStartCycle = simulation.cycle; S.inGame = true; S.starting = false; afterLevelLoaded(); });
+        const onLevelStart = guard('level.start.post', () => { S.levelStartCycle = simulation.cycle; S.lvGraceUntil = now() + 1500; try { if (!S.dead && S.inGame && !S.solo && hasPeers() && m.immuneCycle < m.cycle + 90) m.immuneCycle = m.cycle + 90; } catch (e) { } S.inGame = true; S.starting = false; afterLevelLoaded(); });
         // Build every level from the SAME random numbers on every client:
         //  1. the seed is derived from (run seed, level number), independent of anything else that happened in the run
         //  2. plain Math.random (used by some map generators for sizes, counts and drops) is swapped for the seeded generator
@@ -1574,6 +1625,267 @@
                 if (Number.isFinite(e[3])) Body.setAngle(bd, e[3] / 1000);
             }
         }
+
+        // ---- leaving a match, saving it to a file and loading it again (every player's checkpoint, not just the host's) ----
+        const bigIn = new Map();
+        function sendBig(tag, obj, to) {
+            let str; try { str = JSON.stringify(obj); } catch (e) { return false; }
+            const id = (S.id || 'x').slice(-12) + '_' + (S.bigSeq = (S.bigSeq | 0) + 1);
+            const n = Math.max(1, Math.ceil(str.length / 6000));
+            for (let i = 0; i < n; i++) sendEv({ t: 'big', tag, id, i, n, s: str.slice(i * 6000, (i + 1) * 6000) }, to);
+            return true;
+        }
+        H.big = (p, d) => {
+            if (typeof d.tag !== 'string' || d.tag.length > 12 || typeof d.id !== 'string' || d.id.length > 40 || !Number.isInteger(d.i) || !Number.isInteger(d.n) || d.n < 1 || d.n > 600 || d.i < 0 || d.i >= d.n || typeof d.s !== 'string' || d.s.length > 6100) return;
+            const key = p.id + '|' + d.id;
+            let e = bigIn.get(key);
+            if (!e) { e = { tag: d.tag, n: d.n, parts: new Array(d.n), got: 0, at: now() }; bigIn.set(key, e); }
+            if (e.n !== d.n) return;
+            if (e.parts[d.i] === undefined) { e.parts[d.i] = d.s; e.got++; }
+            if (e.got === e.n) {
+                bigIn.delete(key);
+                let obj; try { obj = JSON.parse(e.parts.join('')); } catch (er) { return; }
+                try { onBig(p, e.tag, obj); } catch (er) { console.warn('[MP] big', er); }
+            }
+            if (bigIn.size > 8) for (const [k, v] of bigIn) if (now() - v.at > 60000) bigIn.delete(k);
+        };
+        function onBig(p, tag, o) {
+            if (!o || typeof o !== 'object') return;
+            if (tag === 'save' && S.isHost && S.saveJob && o.id === S.saveJob.id) { S.saveJob.got.set(p.id, { name: p.name, save: o.save }); S.saveJob.check(); }
+            else if (tag === 'load' && isHostPeer(p) && !S.isHost && !S.inGame && !S.starting) guestLoadSave(o.save);
+        }
+        H.saveReq = (p, d) => { if (!isHostPeer(p) || typeof d.id !== 'string' || d.id.length > 40) return; sendBig('save', { id: d.id, save: mySave() }, p.id); };
+        H.end = (p, d) => {
+            if (!isHostPeer(p) || S.isHost || !S.inGame) return;
+            say((p.name || 'The host') + ' ended the match');
+            try { ui.banner((p.name || 'The host') + ' ended the match.'); setTimeout(() => ui.banner(null), 3500); } catch (e) { }
+            exitToTitle();
+        };
+        function mySave() {
+            try {
+                if (typeof saveGame === 'undefined' || !saveGame || !saveGame.latest) return null;     // checkpoints begin when level 2 starts
+                return JSON.parse(JSON.stringify(saveGame.latest));
+            } catch (e) { return null; }
+        }
+        function collectMatch() {
+            return new Promise(resolve => {
+                const open = openPeers().filter(p => p.hello);
+                const job = { id: 'sv' + Date.now().toString(36), got: new Map() };
+                let tm = 0;
+                const finish = () => {
+                    if (job.done) return; job.done = true; clearTimeout(tm); S.saveJob = null;
+                    const players = [];
+                    for (const v of job.got.values()) if (v && v.save && typeof saveGame !== 'undefined' && saveGame.isValid(v.save)) players.push({ name: String(v.name || 'player').slice(0, 24), save: v.save });
+                    resolve({
+                        ngonMP: 1, v: 1, time: Date.now(),
+                        host: { name: S.baseName, save: mySave() }, players,
+                        room: { max: S.room.max, ask: S.room.ask, gun: S.room.gun, together: S.together, pvp: S.pvp },
+                        missing: open.length - job.got.size
+                    });
+                };
+                job.check = () => { if (job.got.size >= open.length) finish(); };
+                S.saveJob = job;
+                tm = setTimeout(finish, 8000);
+                if (!open.length) finish(); else sendEv({ t: 'saveReq', id: job.id });
+            });
+        }
+        function downloadJSON(obj, fname) {
+            const blob = new Blob([JSON.stringify(obj)], { type: 'application/json' });
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob); a.download = fname;
+            document.body.appendChild(a); a.click();
+            setTimeout(() => { try { URL.revokeObjectURL(a.href); a.remove(); } catch (e) { } }, 1500);
+        }
+        function stamp() { const d = new Date(); const z = n => String(n).padStart(2, '0'); return d.getFullYear() + z(d.getMonth() + 1) + z(d.getDate()) + '-' + z(d.getHours()) + z(d.getMinutes()); }
+        function exitToTitle() {
+            try {
+                S.matchLoaded = false; S.dead = false;
+                simulation.paused = true; m.alive = false;
+                try { Matter.Composite.clear(engine.world); Matter.Engine.clear(engine); } catch (e) { }
+                try { document.getElementById('fade-out').style.opacity = 0; } catch (e) { }
+                try { document.getElementById('defense-bar').style.display = 'none'; document.getElementById('text-log').style.display = 'none'; } catch (e) { }
+                simulation.splashReturn();
+            } catch (e) { console.warn('[MP] exit', e); }
+        }
+        function askConfirm(o) {
+            return new Promise(resolve => {
+                const ov = document.createElement('div');
+                ov.style.cssText = 'position:fixed;inset:0;z-index:2147483000;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;font:15px/1.4 Arial,Helvetica,sans-serif';
+                const box = document.createElement('div');
+                box.style.cssText = 'background:#1b2129;color:#f4f6f8;border:1px solid #7a8aa0;border-radius:8px;padding:18px 20px;max-width:min(420px,calc(100vw - 32px));box-shadow:0 8px 30px rgba(0,0,0,.6)';
+                const h = document.createElement('div'); h.style.cssText = 'font-size:18px;font-weight:bold;margin-bottom:8px'; h.textContent = o.title; box.appendChild(h);
+                const t = document.createElement('div'); t.style.cssText = 'margin-bottom:12px;color:#d5dbe3'; t.textContent = o.text || ''; box.appendChild(t);
+                let cb = null;
+                if (o.checkLabel) {
+                    const l = document.createElement('label'); l.style.cssText = 'display:flex;gap:8px;align-items:flex-start;margin-bottom:14px;cursor:pointer';
+                    cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = o.checked !== false; l.appendChild(cb);
+                    const sp = document.createElement('span'); sp.textContent = o.checkLabel; l.appendChild(sp); box.appendChild(l);
+                }
+                const row = document.createElement('div'); row.style.cssText = 'display:flex;gap:10px;justify-content:flex-end';
+                const mkb = (txt, bg) => { const b = document.createElement('button'); b.textContent = txt; b.style.cssText = 'background:' + bg + ';color:#fff;border:1px solid #7a8aa0;border-radius:5px;padding:7px 14px;font-size:14px;cursor:pointer'; return b; };
+                const no = mkb('Cancel', '#3a4658'), ok = mkb(o.okLabel || 'OK', '#a23b3b');
+                row.appendChild(no); row.appendChild(ok); box.appendChild(row); ov.appendChild(box);
+                const close = r => { document.removeEventListener('keydown', key, true); ov.remove(); resolve(r); };
+                const key = e => { if (e.key === 'Escape') { e.stopPropagation(); e.preventDefault(); close({ ok: false }); } };
+                for (const ev of ['keydown', 'keyup', 'keypress', 'mousedown', 'mouseup', 'pointerdown', 'pointerup', 'wheel', 'contextmenu', 'click', 'dblclick']) ov.addEventListener(ev, e => e.stopPropagation());
+                no.onclick = () => close({ ok: false });
+                ok.onclick = () => close({ ok: true, checked: cb ? cb.checked : false });
+                document.addEventListener('keydown', key, true);
+                document.body.appendChild(ov);
+                try { document.exitPointerLock && document.exitPointerLock(); } catch (e) { }
+            });
+        }
+        async function exitMatch() {
+            if (!S.inGame || S.exiting) return;
+            const alone = !hasPeers();
+            const host = S.isHost || alone;
+            const r = await askConfirm({
+                title: host ? (alone ? 'Exit the game?' : 'End the match for everyone?') : 'Leave the match?',
+                text: host ? (alone ? 'You go back to the title screen.' : 'Every player goes back to the title screen.') : 'You go back to the title screen. The others keep playing.',
+                checkLabel: host && !alone ? 'Save the match (every player) to a file, so you can continue it later' : 'Save my checkpoint to a file, so I can continue it later',
+                okLabel: host ? 'End match' : 'Leave', checked: true
+            });
+            if (!r.ok) return;
+            S.exiting = true;
+            try {
+                if (r.checked) {
+                    if (host && !alone) {
+                        const f = await collectMatch();
+                        if (f.host.save || f.players.length) {
+                            downloadJSON(f, 'n-gon-match-' + stamp() + '.json');
+                            say('match saved (' + (f.players.length + (f.host.save ? 1 : 0)) + ' players' + (f.missing > 0 ? ', ' + f.missing + ' did not answer' : '') + ')');
+                        } else say('nothing to save yet: checkpoints start when the second level begins');
+                    } else {
+                        const sv = mySave();
+                        if (sv) { downloadJSON(sv, 'n-gon-checkpoint-' + stamp() + '.json'); say('checkpoint saved'); }
+                        else say('nothing to save yet: checkpoints start when the second level begins');
+                    }
+                }
+                if (host && !alone) sendEv({ t: 'end', by: S.baseName });
+                setTimeout(() => { exitToTitle(); S.exiting = false; }, host && !alone ? 250 : 0);
+            } catch (e) { S.exiting = false; console.warn('[MP] exit', e); }
+        }
+        async function saveMatchNow() {
+            if (!S.inGame || !(S.isHost || !hasPeers())) return;
+            const f = await collectMatch();
+            if (f.host.save || f.players.length) { downloadJSON(f, 'n-gon-match-' + stamp() + '.json'); say('match saved'); }
+            else say('nothing to save yet: checkpoints start when the second level begins');
+        }
+        function guestLoadSave(sv) {
+            try {
+                if (!sv || typeof saveGame === 'undefined' || !saveGame.isValid(sv)) return;
+                S.guestLoad = true; S.matchLoaded = true;
+                const r = saveGame.load(sv);
+                setTimeout(() => { S.guestLoad = false; }, 15000);
+                if (r && typeof r.catch === 'function') r.catch(e => console.warn('[MP] load', e));
+            } catch (e) { S.guestLoad = false; console.warn('[MP] guest load', e); }
+        }
+        async function loadMatchFile(file) {
+            try {
+                if (S.inGame) { say('go back to the title screen first'); return; }
+                if (hasPeers() && !S.isHost) { say('only the host can load a match'); return; }
+                const o = JSON.parse(await file.text());
+                if (typeof saveGame === 'undefined') { say('this n-gon version has no checkpoints'); return; }
+                // a plain n-gon checkpoint also works (everybody continues from it)
+                const match = o && o.ngonMP === 1 ? o : { ngonMP: 1, host: { name: S.baseName, save: o }, players: [], room: null };
+                const valid = sv => sv && saveGame.isValid(sv);
+                const entries = (match.players || []).filter(e => e && valid(e.save));
+                const hostSave = valid(match.host && match.host.save) ? match.host.save : (entries[0] && entries[0].save);
+                if (!hostSave) { say('that file has no usable checkpoint'); try { alert('That file has no usable n-gon checkpoint.'); } catch (e) { } return; }
+                if (match.room && S.isHost !== false) {
+                    S.room.max = Math.max(2, Math.min(12, match.room.max | 0 || 8)); S.room.ask = match.room.ask !== false; S.room.gun = match.room.gun !== false;
+                    S.together = match.room.together !== false; S.pvp = match.room.pvp === true;
+                    sendRoom(); ui.refresh();
+                }
+                const open = openPeers().filter(p => p.hello);
+                const used = new Set();
+                const notes = [];
+                for (const p of open) {
+                    const e = entries.find(x => !used.has(x) && String(x.name).toLowerCase() === String(p.name).toLowerCase());
+                    if (e) used.add(e); else notes.push(p.name);
+                    sendBig('load', { save: e ? e.save : hostSave }, p.id);
+                }
+                try { ui.banner('Loading the saved match...'); setTimeout(() => ui.banner(null), 3000); } catch (e) { }
+                if (notes.length) say(notes.join(', ') + ' had no save in this file and continue from the host\'s checkpoint');
+                setTimeout(() => { try { const r = saveGame.load(hostSave); if (r && r.catch) r.catch(e => console.warn('[MP] load', e)); } catch (e) { console.warn('[MP] load', e); } }, open.length ? 1500 : 0);
+            } catch (e) { say('could not read that file'); console.warn('[MP] load file', e); }
+        }
+
+        // ---- lobby play: on the title screen every connected player's character appears, moves and can push the title block ----
+        const LB = new Map(); S.LB = LB;      // peer id -> latest title-screen state
+        const lobbyOn = () => { try { return typeof titlePage !== 'undefined' && titlePage && titlePage.isOn && simulation.onTitlePage === true && !S.inGame && !S.starting && hasPeers(); } catch (e) { return false; } };
+        H.lb = (p, d) => {
+            if (S.inGame) return;
+            const n = (v, lim) => (Number.isFinite(v) && Math.abs(v) < lim) ? v : 0;
+            const e = { x: n(d.x, 1e6) / 10, y: n(d.y, 1e6) / 10, vx: n(d.vx, 2e4) / 100, vy: n(d.vy, 2e4) / 100, a: n(d.a, 1e4) / 1000, og: d.og ? 1 : 0, yo: (n(d.yo, 2e3) / 10) || 49, at: now(), id: p.id };
+            if (Array.isArray(d.b) && d.b.length === 5 && d.b.every(v => Number.isFinite(v) && Math.abs(v) < 1e6)) e.b = [d.b[0] / 10, d.b[1] / 10, d.b[2] / 1000, d.b[3] / 100, d.b[4] / 100];
+            LB.set(p.id, e);
+            try { if (titlePage.isOn) titlePage.wake(); } catch (er) { }
+        };
+        const lbGhosts = new Map();          // peer id -> physics body that can shove the title block
+        const lbFresh = () => { const t = now(); const r = []; for (const e of LB.values()) if (t - e.at < 1500 && S.peers.has(e.id)) r.push(e); return r; };
+        function lbPos(e) { const dt = Math.min(0.12, (now() - e.at) / 1000); return { x: e.x + e.vx * dt * 72, y: e.y + e.vy * dt * 72 }; }
+        function lbCleanup() { for (const [id, g] of lbGhosts) { try { Matter.Composite.remove(engine.world, g); } catch (e) { } lbGhosts.delete(id); } }
+        rawSetInterval(guard('lobbyTx', () => {
+            if (!lobbyOn()) { if (LB.size) LB.clear(); if (lbGhosts.size) lbCleanup(); return; }
+            const pkt = { t: 'lb', x: q(player.position.x, 10), y: q(player.position.y, 10), vx: q(player.velocity.x, 100), vy: q(player.velocity.y, 100), a: q(m.angle, 1000), og: m.onGround ? 1 : 0, yo: q(m.yOff, 10) };
+            const blk = body && body[0];
+            if (blk && !blk.isStatic) {
+                const near = Math.hypot(blk.position.x - player.position.x, blk.position.y - player.position.y) < 140;
+                if (m.holdingTarget === blk || (near && (blk.speed > 0.3 || player.speed > 1))) { pkt.b = [q(blk.position.x, 10), q(blk.position.y, 10), q(blk.angle, 1000), q(blk.velocity.x, 100), q(blk.velocity.y, 100)]; S.lbClaim = now(); }
+            }
+            sendSt(pkt);
+        }), 40);
+        try {
+            if (typeof titlePage !== 'undefined' && titlePage && typeof titlePage.step === 'function') {
+                wrapFn(titlePage, 'step', 'titlePage.step', orig => function () {
+                    const fresh = lobbyOn() ? lbFresh() : [];
+                    const alive = new Set();
+                    for (const e of fresh) {
+                        alive.add(e.id);
+                        const pos = lbPos(e);
+                        let g = lbGhosts.get(e.id);
+                        if (!g) {
+                            g = Matter.Bodies.rectangle(pos.x, pos.y, 34, 84, { inertia: Infinity, friction: 0, frictionAir: 0 });
+                            g.collisionFilter = { category: 0x40000000, mask: cat.body, group: 0 };
+                            Matter.Body.setMass(g, 12);
+                            Matter.Composite.add(engine.world, g); lbGhosts.set(e.id, g);
+                        }
+                        Matter.Body.setPosition(g, { x: pos.x, y: pos.y + 10 });
+                        Matter.Body.setVelocity(g, { x: e.vx, y: e.vy });
+                        Matter.Body.setAngle(g, 0);
+                        // the title block follows whoever is pushing it
+                        const blk = body && body[0];
+                        if (e.b && blk && !blk.isStatic && !(m.holdingTarget === blk) && now() - (S.lbClaim || 0) > 400 && now() - e.at < 300) {
+                            Matter.Body.setPosition(blk, { x: blk.position.x + (e.b[0] - blk.position.x) * 0.5, y: blk.position.y + (e.b[1] - blk.position.y) * 0.5 });
+                            Matter.Body.setAngle(blk, e.b[2]);
+                            Matter.Body.setVelocity(blk, { x: e.b[3], y: e.b[4] });
+                        }
+                    }
+                    for (const [id, g] of lbGhosts) if (!alive.has(id)) { try { Matter.Composite.remove(engine.world, g); } catch (e) { } lbGhosts.delete(id); }
+                    const r = orig.apply(this, arguments);
+                    if (fresh.length) {
+                        try {
+                            ctx.save(); ctx.setTransform(titlePage.zoom, 0, 0, titlePage.zoom, 0, 0);
+                            for (const e of fresh) {
+                                const pp = S.peers.get(e.id); if (!pp) continue;
+                                const pos = lbPos(e);
+                                pp.og = e.og; pp.yOff = e.yo;
+                                drawRemotePlayer(pp, { x: pos.x, y: pos.y, a: e.a, vx: e.vx }, false);
+                                ctx.font = 'bold 22px Arial'; ctx.textAlign = 'center'; ctx.lineJoin = 'round'; ctx.lineWidth = 5; ctx.strokeStyle = 'rgba(255,255,255,0.95)';
+                                ctx.strokeText(pp.name, pos.x, pos.y - 52); ctx.fillStyle = '#111'; ctx.fillText(pp.name, pos.x, pos.y - 52);
+                            }
+                            ctx.restore();
+                        } catch (er) { try { ctx.restore(); } catch (e2) { } }
+                    }
+                    return r;
+                });
+                wrapFn(titlePage, 'isIdle', 'titlePage.isIdle', orig => function () {
+                    if (lobbyOn() && lbFresh().length) return false;        // others are moving: keep the title loop running
+                    return orig.apply(this, arguments);
+                });
+            } else HOOKS['titlePage'] = false;
+        } catch (e) { console.warn('[MP] lobby hook', e); }
         // ---- features of newer n-gon builds: checkpoints, level editor ----
         function watchSaveLoad() {
             if (S.saveWatching) return;
@@ -1598,7 +1910,7 @@
             // saveGame.load is the single entry for continueRun / import / rewind
             if (typeof saveGame !== 'undefined' && saveGame && typeof saveGame.load === 'function') {
                 wrapFn(saveGame, 'load', 'saveGame.load', orig => function () {
-                    if (hasPeers() && !S.isHost) { say('only the host can load a checkpoint while connected'); return undefined; }
+                    if (hasPeers() && !S.isHost && !S.guestLoad) { say('only the host can load a checkpoint while connected'); return undefined; }
                     S.savePending = true; watchSaveLoad();
                     const done = () => { if (!S.saveStarted) { S.savePending = false; } };   // load bailed out before starting a game
                     let r;
@@ -1678,7 +1990,7 @@
         }
 
         // ------------------------------------------------------------------ mobs
-        const realMobs = () => mob.filter(mo => mo && !mo.isGhost);
+        const realMobs = () => mob.filter(mo => mo && !mo.isGhost && !mo._local);
         function removeBodyAndConstraints(t) {
             if (!t) return;
             try {
@@ -1700,6 +2012,17 @@
                 let fn; try { fn = spawn[key]; } catch (e) { continue; }
                 if (typeof fn !== 'function' || fn._mp || SKIP_SPAWN.test(key)) continue;
                 try { if (!Object.getOwnPropertyDescriptor(spawn, key).writable) continue; } catch (e) { continue; }
+                if (/^(darkMatter|WIMP)$/.test(key)) {
+                    // a tech's companion (dark matter, WIMPs) belongs to the player who owns the tech: it exists only on that player's game and is never synced
+                    const wl = function (...args) {
+                        if (S.inPuppet && !S.replay) return undefined;
+                        const before = mob.length;
+                        const r = fn.apply(this, args);
+                        for (let i = before; i < mob.length; i++) { const mo = mob[i]; if (mo && !mo.isGhost) { mo._local = true; mo._keep = true; } }
+                        return r;
+                    };
+                    wl._mp = true; spawn[key] = wl; continue;
+                }
                 const w = function (...args) {
                     if (S.inPuppet && !S.replay) return undefined;   // puppets never spawn on their own
                     if (!S.isHost && !S.buildingLevel && !S.replay) return undefined; // runtime enemy spawns are host-authoritative
@@ -1931,7 +2254,7 @@
             if (S.isHost) {
                 const curM = new Set(), fresh = [];
                 for (const mo of mob) {
-                    if (!mo || mo.isGhost) continue;
+                    if (!mo || mo.isGhost || mo._local) continue;
                     if (mo._nid === undefined) { mo._nid = 'D' + LC() + '_' + S.id + '_' + (S.ctr++); mobMap.set(mo._nid, mo); fresh.push(mo); }
                     if (mo.alive) curM.add(mo._nid);
                 }
@@ -2270,8 +2593,11 @@
         function drawVm(p) {
             const vm = p.vm; if (!vm || !vm.g.length || now() - vm.at > 250 || VM.cur) return;
             const cur = p.cur;
-            const fr = Math.max(-9, Math.min(8, (now() - CFG.interpMs - (Number.isFinite(vm.t) ? vm.t : vm.at)) / stepMs()));
-            for (const g0 of vm.g) {
+            const he = histPick(p);
+            const fr = he ? Math.max(0, Math.min(8, (now() - CFG.interpMs - he.t) / stepMs())) : 0;
+            const list = vm.g.filter(g => g.k !== 1);
+            if (he && he.vm && he.vm.g) for (const g of he.vm.g) if (g.k === 1) list.push(g);   // moving visuals (bullets, grenades...) come from the snapshot that matches the ghost's moment
+            for (const g0 of list) {
                 const flash = g0.k >= 10;
                 if (flash && now() - vm.at > 110) continue;                                          // flashes are shown briefly, once
                 const g = flash ? { ...g0, k: g0.k - 10 } : g0;
@@ -2401,17 +2727,31 @@
                 i += 5 + 2 * n;
             }
         }
+        function histPick(p) {
+            const h = p.hist; if (!h || !h.length) return null;
+            const dt = now() - CFG.interpMs; let e = null;
+            for (const x of h) { if (x.t <= dt) e = x; else break; }
+            return e;
+        }
         function drawPeerBullets(p) {
+            const he = histPick(p);
+            if (!he) return;
+            const sv = { bl: p.bl, bp: p.bp, blT: p.blT };
+            p.bl = he.bl; p.bp = he.bp; p.blT = he.t;
+            try { drawPeerBullets0(p); } finally { p.bl = sv.bl; p.bp = sv.bp; p.blT = sv.blT; }
+        }
+        function drawPeerBullets0(p) {
             const a = p.bl;
-            if (!a || !a.length || now() - p.blAt > CFG.staleMs) { if (p.bp && now() - p.blAt <= CFG.staleMs) { const fr0 = Math.max(-9, Math.min(8, (now() - CFG.interpMs - (Number.isFinite(p.blT) ? p.blT : p.blAt)) / stepMs())); drawPeerPolys(p, fr0, (typeof color !== 'undefined' && color.bullet) || '#000'); } return; }
+            if (!a || !a.length || now() - p.blAt > CFG.staleMs) { if (p.bp && now() - p.blAt <= CFG.staleMs) { const fr0 = Math.max(0, Math.min(8, (now() - CFG.interpMs - (Number.isFinite(p.blT) ? p.blT : p.blAt)) / stepMs())); drawPeerPolys(p, fr0, (typeof color !== 'undefined' && color.bullet) || '#000'); } return; }
             // ghosts are drawn interpMs in the past: put their bullets at the same moment (extrapolating backwards a few steps is fine for linear flight)
-            const fr = Math.max(-9, Math.min(8, (now() - CFG.interpMs - (Number.isFinite(p.blT) ? p.blT : p.blAt)) / stepMs()));
+            const fr = Math.max(0, Math.min(8, (now() - CFG.interpMs - (Number.isFinite(p.blT) ? p.blT : p.blAt)) / stepMs()));
             const fill = (typeof color !== 'undefined' && color.bullet) || '#000';
             drawPeerPolys(p, fr, fill);
             for (let i = 0; i + 7 < a.length; i += 8) {
                 const x = a[i] + a[i + 2] / 10 * fr, y = a[i + 1] + a[i + 3] / 10 * fr;
                 const w = a[i + 6], h = a[i + 7], kind = a[i + 4];
                 if (![x, y, w, h].every(Number.isFinite) || Math.abs(x) > 1e7 || Math.abs(y) > 1e7 || w <= 0 || w > 5000 || h < 0 || h > 5000) continue;
+                if (S.dbgBl) S.dbgBl.push([performance.now(), i / 8, x, y, p.cur ? p.cur.x : 0, p.cur ? p.cur.y : 0]);
                 ctx.save(); ctx.fillStyle = fill; ctx.beginPath();
                 if (kind === 0) ctx.arc(x, y, Math.max(1.5, w), 0, 2 * Math.PI);
                 else if (kind === 1) { ctx.translate(x, y); ctx.rotate(a[i + 5] / 100); ctx.rect(-w / 2, -h / 2, w, h); }
@@ -2704,14 +3044,14 @@
             const me = mk('div', '', panel, 'muted');
             const list = mk('div', '', panel);
             mk('div', 'Room settings', panel, 'sec');
-            const rs = mk('div', '', panel, 'muted');
+            const rs = mk('div', '', panel, 'muted'); rs.style.display = 'none';
             const r = mk('div', '', panel, 'r');
             const t1 = mk('label', '', r);
             const tcb = mk('input', '', t1); tcb.type = 'checkbox'; tcb.checked = S.together;
             mk('span', ' stay together', t1);
             const t2 = mk('label', '', r);
             const pcb = mk('input', '', t2); pcb.type = 'checkbox'; pcb.checked = S.pvp;
-            mk('span', ' pvp (off by default)', t2);
+            mk('span', ' pvp', t2);
             const r2 = mk('div', '', panel, 'r');
             const t3 = mk('label', '', r2);
             const acb = mk('input', '', t3); acb.type = 'checkbox'; acb.checked = S.room.ask;
@@ -2721,19 +3061,44 @@
             const msel = mk('select', '', t4);
             for (let n = 2; n <= 12; n++) { const o = mk('option', String(n), msel); o.value = String(n); }
             msel.value = String(S.room.max);
+            const r3 = mk('div', '', panel, 'r');
+            const t5 = mk('label', '', r3);
+            const gcb = mk('input', '', t5); gcb.type = 'checkbox'; gcb.checked = S.room.gun;
+            mk('span', ' everyone starts with a gun', t5);
+            mk('div', 'Match', panel, 'sec');
+            const mr = mk('div', '', panel, 'r');
+            const bExit = mk('button', 'Exit match...', mr); bExit.onclick = () => exitMatch();
+            const bSave = mk('button', 'Save match to file', mr); bSave.onclick = () => saveMatchNow();
+            const bLoad = mk('button', 'Load saved match...', mr);
+            const fIn = mk('input', '', mr); fIn.type = 'file'; fIn.accept = '.json,application/json'; fIn.style.display = 'none';
+            bLoad.onclick = () => fIn.click();
+            fIn.onchange = () => { const f = fIn.files && fIn.files[0]; fIn.value = ''; if (f) loadMatchFile(f); };
+            const matchSync = () => {
+                const hostish = S.isHost || !hasPeers();
+                bExit.style.display = S.inGame ? '' : 'none';
+                bSave.style.display = S.inGame && hostish ? '' : 'none';
+                bLoad.style.display = !S.inGame && hostish ? '' : 'none';
+            };
+            const r4 = mk('div', '', panel, 'r');
+            const t6 = mk('label', '', r4);
+            const ccb = mk('input', '', t6); ccb.type = 'checkbox'; ccb.checked = communityOn();
+            mk('span', ' include community maps (host\'s level pool)', t6);
             const st = mk('div', 'Status: ...', panel, 'muted');
             const roomEditable = () => S.isHost || !hasPeers();
             const roomChanged = () => {
                 if (!roomEditable()) { syncRoom(); return; }
-                S.together = tcb.checked; S.pvp = pcb.checked; S.room.ask = acb.checked; S.room.max = Math.max(2, Math.min(12, +msel.value || 8));
+                S.together = tcb.checked; S.pvp = pcb.checked; S.room.ask = acb.checked; S.room.max = Math.max(2, Math.min(12, +msel.value || 8)); S.room.gun = gcb.checked;
                 sendRoom();
                 syncRoom();
             };
-            tcb.onchange = pcb.onchange = acb.onchange = msel.onchange = roomChanged;
-            function syncRoom() {                                       // show the real values; only the host (or someone alone) can change them
-                tcb.checked = !!S.together; pcb.checked = !!S.pvp; acb.checked = !!S.room.ask; msel.value = String(S.room.max);
+            tcb.onchange = pcb.onchange = acb.onchange = msel.onchange = gcb.onchange = roomChanged;
+            ccb.onchange = () => { if (roomEditable() && !S.inGame) { setCommunity(ccb.checked); sendRoom(); } syncRoom(); };
+            function syncRoom() {                                       // show the real values
+                matchSync();
+                ccb.checked = (S.isHost || !hasPeers()) ? communityOn() : !!S.room.comm;
+                gcb.checked = !!S.room.gun; tcb.checked = !!S.together; pcb.checked = !!S.pvp; acb.checked = !!S.room.ask; msel.value = String(S.room.max);
                 const ed = roomEditable();
-                tcb.disabled = pcb.disabled = acb.disabled = msel.disabled = !ed;
+                tcb.disabled = pcb.disabled = acb.disabled = msel.disabled = gcb.disabled = !ed; ccb.disabled = !ed || S.inGame;
                 let info = ed ? 'You are the host: these settings apply to everyone.' : 'Set by the host - you cannot change them.';
                 try { info += ' Seed ' + getSeed() + ' - difficulty ' + (simulation.difficultyMode != null ? ['easy', 'normal', 'hard', 'why'][simulation.difficultyMode] || simulation.difficultyMode : '?') + (simulation.isCommunityMaps ? ' - community maps' : ''); } catch (e) { }
                 rs.textContent = info;
@@ -2815,7 +3180,7 @@
             }
             return {
                 setId(id) {
-                    me.textContent = 'Your session ID: ' + id;
+                    me.textContent = ''; me.style.display = 'none';
                     if (document.activeElement !== topName) topName.value = S.baseName;
                 },
                 status(s) { st.textContent = 'Status: ' + s; },
@@ -2881,6 +3246,28 @@
         wrapPopulateLevels();
         wrapLevelFrameRandom();
         wrapNewFeatures();
+        // every player gets their OWN random gun / field / tech choices (n-gon's seeded generator would otherwise offer the same ones to everybody)
+        for (const k of ['gun', 'field', 'tech']) {
+            if (typeof powerUps !== 'undefined' && powerUps[k]) wrapFn(powerUps[k], 'effect', 'powerUps.' + k + '.effect', orig => function () {
+                if (!(S.inGame && !S.solo && hasPeers() && typeof Math.hash === 'function')) return orig.apply(this, arguments);
+                const realSeed = Math.seed;
+                try { Math.seed = Math.abs(Math.hash(S.id + '|' + (S.pickN = (S.pickN | 0) + 1) + '|' + Date.now() + '|' + (performance.now() | 0))); return orig.apply(this, arguments); }
+                finally { Math.seed = realSeed; }
+            });
+        }
+        // harder difficulties delay the first gun; in a shared room everybody can still start armed (host option)
+        if (typeof powerUps !== 'undefined' && typeof powerUps.spawnStartingPowerUps === 'function') {
+            wrapFn(powerUps, 'spawnStartingPowerUps', 'powerUps.spawnStartingPowerUps', orig => function (x, y) {
+                try {
+                    if (S.inGame && !S.solo && hasPeers() && S.room.gun !== false && level.levelsCleared === 0 && b.inventory.length === 0 && !this._mpGunGiven
+                        && powerUps.difficulty.equipmentDelay() > 0) {
+                        this._mpGunGiven = true; setTimeout(() => { powerUps._mpGunGiven = false; }, 3000);
+                        powerUps.spawn(x + 30, y, 'gun', false);
+                    }
+                } catch (e) { }
+                return orig.apply(this, arguments);
+            });
+        }
         if (typeof powerUps !== 'undefined' && powerUps.difficulty) {
             wrapFn(powerUps.difficulty, 'effect', 'powerUps.difficulty.effect', orig => function () {
                 if (S.inGame && !S.solo && hasPeers() && !S.isHost) {
@@ -2929,6 +3316,22 @@
                 return r;
             });
         } else HOOKS['b.explosion'] = false;
+
+        // hit particles (the black circle where YOUR attack lands on an enemy) are drawn only where the bullet is; copy them to the others' screens
+        const fxSeen = new WeakSet();
+        Matter.Events.on(engine, 'afterUpdate', guard('fxScan', () => {
+            const list = simulation.drawList;
+            if (!list || !list.length) return;
+            const live = hasPeers() && !S.solo && S.inGame && !S.loading;
+            for (let i = 0; i < list.length; i++) {
+                const e = list[i];
+                if (!e || typeof e !== 'object' || fxSeen.has(e)) continue;
+                fxSeen.add(e);
+                if (!live || e._mp || e.color !== simulation.playerDmgColor) continue;
+                if (Number.isFinite(e.x) && Number.isFinite(e.y) && Number.isFinite(e.radius) && e.radius > 0 && e.radius < 3000) fxQ.push([q(e.x), q(e.y), q(e.radius), e.color]);
+            }
+            if (fxQ.length > 24) fxQ = fxQ.slice(-24);
+        }));
 
         // Keep n-gon's native 72 Hz simulation speed regardless of the selected FPS cap.
         // The original game advances one simulation cycle per rendered frame, so selecting
@@ -3020,6 +3423,9 @@
             if (!S.inGame && !S.loading && run) { S.inGame = true; if (S.runSeed == null) S.runSeed = String(Math.initialSeed != null ? Math.initialSeed : getSeed()); afterLevelLoaded(); ui.refresh(); }
             else if (S.inGame && !run && typeof simulation.onTitlePage === 'boolean') { S.inGame = false; S.loading = false; S.paused = false; if (S.solo) { S.solo = false; refreshRole(); } destroyGhosts(); resetSync(); ui.refresh(); }   // back on the title screen
         }), 500);
+        try {
+            simulation.clearTimeouts = function () { let id = window.setTimeout(function () { }, 0); while (id--) { if (!PROT.has(id)) window.clearTimeout(id); } };
+        } catch (e) { }
         installVisualMirror();
         startPeer(S.baseName);
         window.ngonMP = {
