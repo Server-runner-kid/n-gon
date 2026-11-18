@@ -1,5 +1,5 @@
 /*
- * n-gon multiplayer v10-P (title-screen lobby play, community-maps option; v10-L: exit match, save and load whole matches, timers survive title return; v10-K: attack timing, hit particles, single corpse, own choices, companions, host-only start; v10-J: cloak flash, blend modes, host-authoritative difficulty, guest experiment scroll; spectator camera, gravity-flip buttons, host room settings, panel UI; triangle bullets sent as real polygons; flash frames, shared self-spawned pickups, experimental ready gate, 9 KB packet budget, hashed mob roster; spectators removed from the world, real skins mirrored, no duplicate mob-death visuals, touch-to-claim blocks; F stability: packet validation/rate limits/chunking, pruning, invalid-body cleanup; visual mirror, guest mob effects, printed flag, real bullet shapes, cloak fix, spectators non-solid, pilot wave claim, shared experimental mode) / v9-E  (v9-D + match management: host-authoritative level changes, reconnect/late-join parity, duplicate-connection fix, training isolation; combat sync: duplicate-damage guards, mirrored explosions, bullets on the ghost time base, field/immunity visuals; elimination + revival; ordered snapshots; world sync fixes; permission-based joins)
+ * n-gon multiplayer v10-Q (title-screen lobby play, community-maps option; v10-L: exit match, save and load whole matches, timers survive title return; v10-K: attack timing, hit particles, single corpse, own choices, companions, host-only start; v10-J: cloak flash, blend modes, host-authoritative difficulty, guest experiment scroll; spectator camera, gravity-flip buttons, host room settings, panel UI; triangle bullets sent as real polygons; flash frames, shared self-spawned pickups, experimental ready gate, 9 KB packet budget, hashed mob roster; spectators removed from the world, real skins mirrored, no duplicate mob-death visuals, touch-to-claim blocks; F stability: packet validation/rate limits/chunking, pruning, invalid-body cleanup; visual mirror, guest mob effects, printed flag, real bullet shapes, cloak fix, spectators non-solid, pilot wave claim, shared experimental mode) / v9-E  (v9-D + match management: host-authoritative level changes, reconnect/late-join parity, duplicate-connection fix, training isolation; combat sync: duplicate-damage guards, mirrored explosions, bullets on the ghost time base, field/immunity visuals; elimination + revival; ordered snapshots; world sync fixes; permission-based joins)
  *
  * Design
  *  - Every client runs its OWN player, guns, techs and fields with the game's normal code.
@@ -613,7 +613,7 @@
                     if (bd._nid) opsQ.push(['c', bd._nid]);
                 }
                 S.aliveIds = null;
-                S.buttonSent.clear();                                                // re-publish every button state as the new host
+                S.buttonSent.clear(); S.trgSent.clear();                             // re-publish every button state as the new host
                 if (S.inGame && !S.loading && !S.solo) {
                     scanWorld();
                     sendMobRoster();
@@ -666,7 +666,7 @@
                 if (d.seed == null) return;
                 S.runSeed = String(d.seed);
                 S.catchTarget = Math.max(0, d.lc | 0);
-                installLocalLevels(d.ld); beginRun(S.runSeed, d.lv, d.fl, d.df);
+                installLocalLevels(d.ld); beginRun(S.runSeed, d.lv, d.fl, d.df, false, d.tr === 1);
             } else if (!S.inGame && !d.inGame && p.id === (S.sessionHostId || S.hostId) && d.seed != null) {
                 setSeed(String(d.seed));                                        // the joined session host supplies the lobby seed
             } else if (d.inGame && S.inGame && S.together && (d.lc | 0) !== LC()) {
@@ -712,7 +712,7 @@
             S.matchLoaded = false;
             if (!isHostPeer(p) || S.inGame || S.loading || S.starting || d.seed == null) return;
             S.runSeed = String(d.seed); installLocalLevels(d.ld);
-            beginRun(S.runSeed, d.lv, d.fl, d.df, !!d.exp);
+            beginRun(S.runSeed, d.lv, d.fl, d.df, !!d.exp, d.tr === 1);
         };
         H.lvl = (p, d) => {
             if (!S.together || !S.inGame || S.solo || !Number.isFinite(Number(d.lc))) return;
@@ -785,8 +785,8 @@
                 S.forceLv = Array.isArray(d.lv) ? d.lv.map(String).slice(0, 64) : null;
                 S.forceFlip = typeof d.fl === 'boolean' ? d.fl : null;
                 S.forceDf = cleanDiff(d.df);
-                startLocalGame(S.runSeed);
-            } else beginRun(S.runSeed, d.lv, d.fl, d.df);
+                startLocalGame(S.runSeed, false, d.tr === 1);
+            } else beginRun(S.runSeed, d.lv, d.fl, d.df, false, d.tr === 1);
         };
         H.mg = (p, d) => {                // map bodies destroyed by the host
             if (S.isHost || !isHostPeer(p) || (d.lc | 0) !== LC() || !S.mapIds || !Array.isArray(d.l)) return;
@@ -834,21 +834,20 @@
         };
         // A remote press must go through the level's OWN check (`if (button.isUp) { query(); if (!button.isUp) doThing() }`), otherwise levels that
         // react to a press (gravitron's flip, doors...) never run their action on this client. So a press is delivered to the next query call.
-        function applyRemoteButton(button, up, isEvent, fl, cy) {
+        function applyRemoteButton(button, up, isEvent, fl, cy, fs, retry) {
             if (!button) return;
-            if (isEvent && !up && fl !== undefined && level.isVerticalFLipLevel && Number.isFinite(cy)) {
-                if (S.lastFlipCy !== undefined && Math.abs(cy - S.lastFlipCy) <= 6) return;       // the second button of the same press (floor + ceiling pair)
-                S.lastFlipCy = cy;
+            if (isEvent && !up && fl !== undefined && level.isVerticalFLipLevel && Number.isFinite(cy) && !retry) {
+                if (fs !== undefined) { if (fs <= (S.lastFs | 0)) return; S.lastFs = fs; }     // each host flip is applied exactly once, however many buttons report it
             }
             if (isEvent && !up && fl !== undefined && level.isVerticalFLipLevel) button._mpFl = fl;
             // a flip press that arrives while this client is still animating the previous flip must not be lost: wait for the animation to end
-            if (isEvent && !up && level.isFlipping && level.isVerticalFLipLevel && !button._mpWait) {
+            if (isEvent && !up && (level.isFlipping || simulation.cycle - (S.levelStartCycle | 0) <= 120) && level.isVerticalFLipLevel && !button._mpWait) {
                 button._mpWait = true; const t0 = now();
-                const retry = () => {
-                    if (level.isFlipping && now() - t0 < 4000) { setTimeout(retry, 100); return; }
-                    button._mpWait = false; level.isFlipping = false; applyRemoteButton(button, false, true, fl); S.lastFlipCy = undefined;
+                const again = () => {
+                    if ((level.isFlipping || simulation.cycle - (S.levelStartCycle | 0) <= 120) && now() - t0 < 6000) { setTimeout(again, 100); return; }
+                    button._mpWait = false; level.isFlipping = false; applyRemoteButton(button, false, true, fl, cy, fs, true);
                 };
-                setTimeout(retry, 100); return;
+                setTimeout(again, 100); return;
             }
             if (up) { button._mpPending = false; button.isUp = true; return; }
             if (button._mpPending) return;                                     // a press is already waiting for the level's next check
@@ -859,7 +858,7 @@
             if (S.isHost || !isHostPeer(p) || (d.lc | 0) !== LC() || typeof d.i !== 'string' || d.i.length > 24) return;
             const state = { up: !!d.up, cy: Number.isFinite(d.cy) ? d.cy : simulation.cycle };
             S.remoteButtons.set(d.i, state);
-            applyRemoteButton(S.buttons[d.i], state.up, true, Number.isFinite(d.fl) ? d.fl : undefined, state.cy);
+            applyRemoteButton(S.buttons[d.i], state.up, true, Number.isFinite(d.fl) ? d.fl : undefined, state.cy, Number.isFinite(d.fs) ? d.fs : undefined);
         };
         H.btns = (p, d) => {
             if (S.isHost || !isHostPeer(p) || (d.lc | 0) !== LC() || !Array.isArray(d.l)) return;
@@ -1304,7 +1303,7 @@
                 if (n) console.log('[MP] received ' + n + ' local level(s) from the host');
             } catch (e) { console.warn('[MP] local level install failed', e); }
         }
-        function lvInfo() { return { ld: localLevelData(level.levels), lv: Array.isArray(level.levels) ? level.levels.slice() : null, fl: !!simulation.isHorizontalFlipped, df: cleanDiff(simulation.difficultyOptions) }; }
+        function lvInfo() { return { tr: simulation.isTraining ? 1 : 0, ld: localLevelData(level.levels), lv: Array.isArray(level.levels) ? level.levels.slice() : null, fl: !!simulation.isHorizontalFlipped, df: cleanDiff(simulation.difficultyOptions) }; }
         function cleanDiff(o) {
             if (!o || typeof o !== 'object') return null;
             const r = {}; let n = 0;
@@ -1327,14 +1326,14 @@
                 return true;
             });
         }
-        function beginRun(seed, lv, fl, df, exp) {      // join a run started by someone else
+        function beginRun(seed, lv, fl, df, exp, tr) {      // join a run started by someone else
             S.forceLv = Array.isArray(lv) ? lv.map(String).slice(0, 64) : null;
             S.forceFlip = typeof fl === 'boolean' ? fl : null;
             S.forceDf = cleanDiff(df);
             return prepareRoute(S.forceLv).then(ok => {
                 if (!ok) { S.forceLv = null; S.forceFlip = null; }
                 if (S.inGame || S.starting) return;
-                startLocalGame(seed, exp);
+                startLocalGame(seed, exp, tr);
             });
         }
         // level.populateLevels uses plain Math.random for the late "factory/reservoir/interferometer" pick and reads the PER-PLAYER level pool:
@@ -1352,7 +1351,7 @@
                 return undefined;
             });
         }
-        function startLocalGame(seed, exp) {
+        function startLocalGame(seed, exp, tr) {
             if (seed != null) {
                 S.runSeed = String(seed);
                 setSeed(S.runSeed);
@@ -1360,6 +1359,7 @@
             S.applying = true;
             try {
                 if (exp && typeof build !== 'undefined' && typeof build.reset === 'function') { openBuildMenu(); }   // experimental mode: opens this player's own build menu (it starts the shared run itself)
+                else if (tr) simulation.startGame(false, true);
                 else simulation.startGame();
             }
             catch (e) { console.warn('[MP] could not start game', e); }
@@ -1405,7 +1405,12 @@
         wrapFn(simulation, 'startGame', 'simulation.startGame', orig => function () {
             // Training (startGame(false, true)) and build runs (startGame(true)) are private solo runs: nothing is synced.
             const isBuildRun = arguments[0] === true && !arguments[1];
-            if ((arguments[1] === true || (arguments[0] === true && !hasPeers())) && !S.applying) {   // training (and a build run with nobody connected) stays private; a build run with peers is shared
+            const isTrain = arguments[1] === true;
+            if (isTrain && hasPeers() && !S.applying && !S.isHost) {         // training together: only the host starts it
+                try { ui.banner('Only the host can start training.'); setTimeout(() => ui.banner(null), 2500); } catch (e) { }
+                return;
+            }
+            if (((isTrain && !hasPeers()) || (arguments[0] === true && !hasPeers())) && !S.applying) {   // training (and a build run with nobody connected) stays private; a build run with peers is shared
                 S.solo = true; refreshRole();
                 S.runSeed = getSeed(); setSeed(S.runSeed);
                 onStartPre();
@@ -1456,7 +1461,7 @@
                 if (S.runSeed == null) S.runSeed = String(getSeed());
                 if (!loadingSave) setSeed(S.runSeed);
                 // tell everyone only NOW: populateLevels has run, so the host's level order and flip are known
-                if (announce && hasPeers()) sendEv({ t: 'start', seed: S.runSeed, exp: isBuildRun ? 1 : 0, ...lvInfo() });
+                if (announce && hasPeers()) sendEv({ t: 'start', seed: S.runSeed, exp: isBuildRun ? 1 : 0, tr: isTrain ? 1 : 0, ...lvInfo() });
             };
             // startGame is async (community maps / training load extra levels first): everything after that await runs later
             if (r && typeof r.then === 'function') return r.then(v => { fin(); return v; }, e => { S.starting = false; S.loading = false; throw e; });
@@ -1496,7 +1501,7 @@
         //  2. plain Math.random (used by some map generators for sizes, counts and drops) is swapped for the seeded generator
         const hooked = wrapFn(level, 'start', 'level.start', orig => function () {
             S.buildingLevel = true;
-            S.buttons = Object.create(null); S.buttonSeq = 0; S.buttonSent.clear(); S.remoteButtons.clear();
+            S.buttons = Object.create(null); S.buttonSeq = 0; S.buttonSent.clear(); S.remoteButtons.clear(); S.trgObjs.clear(); S.trgState.clear(); S.trgSent.clear(); S.flipSeq = 0; S.lastFs = 0; S.lastPressCy = undefined;
             const realRandom = Math.random;
             const realSeed = Math.seed;
             const seeded = Math.seededRandom;
@@ -1526,7 +1531,122 @@
         });
         if (!hooked) console.warn('[MP] level changes will be detected by polling instead');
 
+
+        // Level-editor triggers (scale, toggle, key cradle, mob-clear, zone): each player used to work out on/off from their OWN player only. The host now decides
+        // (counting every player) and everybody copies its answer, like buttons.
+        S.trgObjs = new Map(); S.trgState = new Map(); S.trgSent = new Map();
+        function trgSend(i, o, to) { sendEv({ t: 'trg', lc: LC(), i, o: o.on, up: o.up, u: o.used }, to); }
+        function trgRead(obj) { return { on: obj.isOn === undefined ? undefined : (obj.isOn ? 1 : 0), up: obj.isUp === undefined ? undefined : (obj.isUp ? 1 : 0), used: obj.isUsed === undefined ? undefined : (obj.isUsed ? 1 : 0) }; }
+        function trgPublish(obj) {
+            if (!S.isHost || S.solo || !hasPeers() || !obj._mpTid) return;
+            const st = trgRead(obj), key = st.on + ',' + st.up + ',' + st.used;
+            if (S.trgSent.get(obj._mpTid) === key) return;
+            S.trgSent.set(obj._mpTid, key); trgSend(obj._mpTid, st);
+        }
+        function trgApply(obj) {
+            const st = S.trgState.get(obj._mpTid); if (!st) return;
+            if (st.on !== undefined && obj.isOn !== undefined) obj.isOn = !!st.on;
+            if (st.up !== undefined && obj.isUp !== undefined) obj.isUp = !!st.up;
+            if (st.used !== undefined && obj.isUsed !== undefined) obj.isUsed = !!st.used;
+        }
+        function trgRegister(kind, x, y, obj) {
+            let id = kind + ':' + Math.round(x) + ':' + Math.round(y), n = 1;
+            while (S.trgObjs.has(id) && S.trgObjs.get(id) !== obj) id = kind + ':' + Math.round(x) + ':' + Math.round(y) + '#' + (++n);
+            obj._mpTid = id; S.trgObjs.set(id, obj); S.trgSent.delete(id);
+            return id;
+        }
+        function trgWrapQuery(obj, hostExtra) {
+            const orig = obj.query; if (typeof orig !== 'function' || orig._mpTrg) return;
+            const w = function () {
+                if (S.isHost) {
+                    const r = withAllPlayersInButtonQuery(() => orig.apply(this, arguments));
+                    if (hostExtra) { try { hostExtra(this); } catch (e) { } }
+                    trgPublish(this); return r;
+                }
+                const r = orig.apply(this, arguments);
+                if (hasPeers() && !S.solo) trgApply(this);
+                return r;
+            };
+            w._mpTrg = true; obj.query = w;
+        }
+        function trgGhostRects() {
+            const out = [];
+            if (!S.isHost) return out;
+            const hw = (player.bounds.max.x - player.bounds.min.x) / 2, hh = (player.bounds.max.y - player.bounds.min.y) / 2;
+            for (const g of ghosts.values()) {
+                const pp = S.peers.get(g.gid);
+                if (!(g && g.alive && g.position && pp && !pp.dead && !peerPaused(pp))) continue;
+                const cy = g.position.y + (Number.isFinite(pp.yOff) ? pp.yOff : 49);
+                out.push({ x: g.position.x, y: cy, bounds: { min: { x: g.position.x - hw, y: cy - hh }, max: { x: g.position.x + hw, y: cy + hh } } });
+            }
+            return out;
+        }
+        H.trg = (p, d) => {
+            if (S.isHost || !isHostPeer(p) || (d.lc | 0) !== LC() || typeof d.i !== 'string' || d.i.length > 40) return;
+            S.trgState.set(d.i, { on: d.o, up: d.up, used: d.u });
+            const obj = S.trgObjs.get(d.i); if (obj) trgApply(obj);
+        };
+        H.trgs = (p, d) => {
+            if (S.isHost || !isHostPeer(p) || (d.lc | 0) !== LC() || !Array.isArray(d.l)) return;
+            for (const e of d.l.slice(0, 300)) { if (Array.isArray(e) && typeof e[0] === 'string') { S.trgState.set(e[0], { on: e[1], up: e[2], used: e[3] }); const o = S.trgObjs.get(e[0]); if (o) trgApply(o); } }
+        };
+        function sendTriggerSnapshot(to) {
+            if (!S.isHost || S.solo || !hasPeers() || !S.trgObjs.size) return;
+            const l = []; for (const [i, o] of S.trgObjs) { const st = trgRead(o); l.push([i, st.on, st.up, st.used]); }
+            sendEv({ t: 'trgs', lc: LC(), l }, to);
+        }
+        function wrapTriggers() {
+            if (typeof level === 'undefined') return;
+            wrapFn(level, 'scale', 'level.scale', orig => function (x, y, width = 189, mass = 6) {
+                const sc = orig.apply(this, arguments); if (!sc) return sc;
+                trgRegister('scale', x, y, sc);
+                const top = { min: { x: x + 2, y: y - 21 }, max: { x: x + width, y: y - 20 } };
+                trgWrapQuery(sc, self => {                         // other players' weight counts too
+                    if (self.isOn) return;
+                    let load = self.load;
+                    for (const g of trgGhostRects()) if (g.bounds.max.x > top.min.x && g.bounds.min.x < top.max.x && g.bounds.max.y > top.min.y && g.bounds.min.y < top.max.y) load += player.mass;
+                    self.load = load; self.isOn = load >= mass;
+                });
+                return sc;
+            });
+            for (const [name, kind] of [['toggle', 'toggle'], ['keyButton', 'key'], ['cleared', 'clear']]) {
+                if (typeof level[name] !== 'function') continue;
+                wrapFn(level, name, 'level.' + name, orig => function (x, y) {
+                    const o = orig.apply(this, arguments); if (!o) return o;
+                    trgRegister(kind, x, y, o); trgWrapQuery(o, null);
+                    return o;
+                });
+            }
+            // editor zones: the element's custom() decides isOn
+            try {
+                const T = typeof levelElements !== 'undefined' && levelElements.types && levelElements.types.zone;
+                if (T && typeof T.build === 'function' && !T.build._mpTrg) {
+                    const ob = T.build;
+                    T.build = function (el) {
+                        const r = ob.apply(this, arguments);
+                        try {
+                            if (r && r.zone && typeof r.custom === 'function') {
+                                const z = r.zone, id = trgRegister('zone', el.x, el.y, z), oc = r.custom;
+                                r.custom = function () {
+                                    if (S.isHost) {
+                                        withAllPlayersInButtonQuery(() => oc.apply(this, arguments));
+                                        if (!z.isOn && el.who === 'player' && el.circle) for (const g of trgGhostRects()) if (Math.hypot(g.x - z.x, g.y - z.y) < z.radius) { z.isOn = true; break; }
+                                        trgPublish(z); return;
+                                    }
+                                    oc.apply(this, arguments);
+                                    if (hasPeers() && !S.solo) trgApply(z);
+                                };
+                            }
+                        } catch (e) { }
+                        return r;
+                    };
+                    T.build._mpTrg = true;
+                }
+            } catch (e) { console.warn('[MP] zone wrap failed', e); }
+        }
+
         function sendButtonSnapshot(to) {
+            sendTriggerSnapshot(to);
             if (!S.isHost || !S.inGame || S.solo || !hasPeers()) return;
             const list = [];
             for (const i of Object.keys(S.buttons)) {
@@ -1539,7 +1659,12 @@
             const i = button._mpButtonId, up = !!button.isUp;
             if (S.buttonSent.get(i) === up) return;
             S.buttonSent.set(i, up);
-            sendEv({ t: 'btn', lc: LC(), cy: simulation.cycle, i, up, fl: level.isVerticalFLipLevel ? (level.isFlipped ? 1 : 0) : undefined });
+            let fs;
+            if (level.isVerticalFLipLevel) {                  // one serial per flip press: a press is only possible while no flip is running, so presses are >30 cycles apart
+                if (!up && simulation.cycle - (S.lastPressCy === undefined ? -1e9 : S.lastPressCy) > 30) { S.flipSeq = (S.flipSeq | 0) + 1; S.lastPressCy = simulation.cycle; }
+                fs = S.flipSeq | 0;
+            }
+            sendEv({ t: 'btn', lc: LC(), cy: simulation.cycle, i, up, fl: level.isVerticalFLipLevel ? (level.isFlipped ? 1 : 0) : undefined, fs });
         }
         function withAllPlayersInButtonQuery(fn) {
             if (!S.isHost || !ghosts.size) return fn();
@@ -1591,7 +1716,10 @@
                                 this.isUp = false; return undefined;
                             }
                         }
-                        if (state) this.isUp = state.up;
+                        // gravity-flip levels: a flip is ONLY triggered by a fresh press event (above). Copying the host's "still held down" state made the
+                        // level flip again by itself the moment the animation ended, so those buttons stay up here.
+                        if (level.isVerticalFLipLevel) this.isUp = true;
+                        else if (state) this.isUp = state.up;
                         return undefined;
                     };
                     wrapped._mpButtonWrapped = true;
@@ -2034,7 +2162,7 @@
             mobMap.clear(); bodyMap.clear(); puMap.clear(); bodySnapshotSeen = null;
             spawnQ = []; deathQ = []; opsQ = []; dropQ = []; ownPuQ = []; fxQ = []; dmgOut.clear(); pvpOut.clear();
             S.aliveIds = null; S.mc = null; S.ctr = 0; S.hostCy = null;
-            S.buttons = Object.create(null); S.buttonSeq = 0; S.buttonSent.clear(); S.remoteButtons.clear();
+            S.buttons = Object.create(null); S.buttonSeq = 0; S.buttonSent.clear(); S.remoteButtons.clear(); S.trgObjs.clear(); S.trgState.clear(); S.trgSent.clear();
             S.mapIds = null; S.mapSent = new Map(); S.mapBase = new Map();
         }
         function afterLevelLoaded() {
@@ -3389,6 +3517,7 @@
             return orig.apply(this, arguments);
         });
         wrapButtons();
+        wrapTriggers();
         wrapPopulateLevels();
         wrapLevelFrameRandom();
         wrapNewFeatures();
