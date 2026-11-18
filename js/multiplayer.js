@@ -1,5 +1,5 @@
 /*
- * n-gon multiplayer v10-M (title-screen lobby play, community-maps option; v10-L: exit match, save and load whole matches, timers survive title return; v10-K: attack timing, hit particles, single corpse, own choices, companions, host-only start; v10-J: cloak flash, blend modes, host-authoritative difficulty, guest experiment scroll; spectator camera, gravity-flip buttons, host room settings, panel UI; triangle bullets sent as real polygons; flash frames, shared self-spawned pickups, experimental ready gate, 9 KB packet budget, hashed mob roster; spectators removed from the world, real skins mirrored, no duplicate mob-death visuals, touch-to-claim blocks; F stability: packet validation/rate limits/chunking, pruning, invalid-body cleanup; visual mirror, guest mob effects, printed flag, real bullet shapes, cloak fix, spectators non-solid, pilot wave claim, shared experimental mode) / v9-E  (v9-D + match management: host-authoritative level changes, reconnect/late-join parity, duplicate-connection fix, training isolation; combat sync: duplicate-damage guards, mirrored explosions, bullets on the ghost time base, field/immunity visuals; elimination + revival; ordered snapshots; world sync fixes; permission-based joins)
+ * n-gon multiplayer v10-P (title-screen lobby play, community-maps option; v10-L: exit match, save and load whole matches, timers survive title return; v10-K: attack timing, hit particles, single corpse, own choices, companions, host-only start; v10-J: cloak flash, blend modes, host-authoritative difficulty, guest experiment scroll; spectator camera, gravity-flip buttons, host room settings, panel UI; triangle bullets sent as real polygons; flash frames, shared self-spawned pickups, experimental ready gate, 9 KB packet budget, hashed mob roster; spectators removed from the world, real skins mirrored, no duplicate mob-death visuals, touch-to-claim blocks; F stability: packet validation/rate limits/chunking, pruning, invalid-body cleanup; visual mirror, guest mob effects, printed flag, real bullet shapes, cloak fix, spectators non-solid, pilot wave claim, shared experimental mode) / v9-E  (v9-D + match management: host-authoritative level changes, reconnect/late-join parity, duplicate-connection fix, training isolation; combat sync: duplicate-damage guards, mirrored explosions, bullets on the ghost time base, field/immunity visuals; elimination + revival; ordered snapshots; world sync fixes; permission-based joins)
  *
  * Design
  *  - Every client runs its OWN player, guns, techs and fields with the game's normal code.
@@ -213,11 +213,17 @@
             S.name = S.baseName;
             teardown();
             ui.status('connecting to network...');
-            let attempt = 1, waited = false;
+            let attempt = 1, waited = false, netRetry = 0;
             const tryOpen = () => {
                 if (gen !== peerGen) return;
                 const p = new Peer(idFor(S.baseName, attempt), { debug: 1 });
                 peer = p; let opened = false;
+                setTimeout(() => {                                   // no answer from the server after 10 s: try again
+                    if (gen !== peerGen || opened || peer !== p) return;
+                    try { p.destroy(); } catch (er) { }
+                    netRetry++; ui.status('connecting to the PeerJS server (try ' + netRetry + ')...');
+                    tryOpen();
+                }, 10000);
                 p.on('open', id => {
                     if (gen !== peerGen) { try { p.destroy(); } catch (e) { } return; }
                     opened = true; S.id = id; S.hostId = id; S.sessionHostId = id; S.firstRole = undefined;
@@ -237,7 +243,14 @@
                         return;
                     }
                     if (type === 'peer-unavailable') { onUnavailable(e); return; }
-                    ui.status('network: ' + (type || e));
+                    if (!opened && ['network', 'server-error', 'socket-error', 'socket-closed', 'disconnected'].includes(type)) {   // the free signalling server is slow or busy: retry quietly instead of showing a raw error
+                        try { p.destroy(); } catch (er) { }
+                        netRetry++;
+                        ui.status('connecting to the PeerJS server (try ' + netRetry + ')...');
+                        setTimeout(tryOpen, Math.min(1000 * netRetry, 5000));
+                        return;
+                    }
+                    ui.status('connection problem (' + (type || e) + ')');
                 });
                 let reconnecting = false;
                 p.on('disconnected', () => {
@@ -644,6 +657,7 @@
 
         H.hello = (p, d) => {
             if (S.isHost) setTimeout(() => sendRoom(p.id), 400);
+            if (S.loreOwn) setTimeout(() => sendEv({ t: 'lore', n: S.loreOwn }, p.id), 600);
             p.name = String(d.name || 'player').slice(0, 20); p.hello = true; p.pvp = d.pvp === true; p.seenAt = now(); p.dead = d.dead === true;
             if (typeof d.ep === 'string' && d.ep !== p.ep) { p.ep = d.ep; p.lastSeq = -1; p.offMin = null; p.buf = []; }
             if (!S.inGame && d.hostId && (p.id === S.sessionHostId || !S.sessionHostId)) { S.sessionHostId = String(d.hostId); S.hostId = S.sessionHostId; }
@@ -652,7 +666,7 @@
                 if (d.seed == null) return;
                 S.runSeed = String(d.seed);
                 S.catchTarget = Math.max(0, d.lc | 0);
-                beginRun(S.runSeed, d.lv, d.fl, d.df);
+                installLocalLevels(d.ld); beginRun(S.runSeed, d.lv, d.fl, d.df);
             } else if (!S.inGame && !d.inGame && p.id === (S.sessionHostId || S.hostId) && d.seed != null) {
                 setSeed(String(d.seed));                                        // the joined session host supplies the lobby seed
             } else if (d.inGame && S.inGame && S.together && (d.lc | 0) !== LC()) {
@@ -697,7 +711,7 @@
         H.start = (p, d) => {
             S.matchLoaded = false;
             if (!isHostPeer(p) || S.inGame || S.loading || S.starting || d.seed == null) return;
-            S.runSeed = String(d.seed);
+            S.runSeed = String(d.seed); installLocalLevels(d.ld);
             beginRun(S.runSeed, d.lv, d.fl, d.df, !!d.exp);
         };
         H.lvl = (p, d) => {
@@ -728,7 +742,24 @@
                 try { simulation.drawList.push({ x, y, radius: r, color: col, time: simulation.drawTime, _mp: true }); } catch (er) { }   // visual only: damage is decided by the owner
             }
         };
-        H.chat = (p, d) => say(esc(p.name) + ': ' + esc(String(d.x || '').slice(0, 200)), true);
+        H.chat = (p, d) => { const t = String(d.x || '').slice(0, 200); p.bubble = { t, at: now() }; chatShow(p.name, t); };
+
+        // Shared "undefined" counter: lore.techCount is per player, so with 4 players the ending needed ONE player to find them all. Everyone's finds are pooled now.
+        S.loreOwn = 0; S.loreSeen = 0; S.loreOth = new Map();
+        H.lore = (p, d) => {
+            if (typeof lore === 'undefined') return;
+            if ((lore.techCount | 0) > S.loreSeen) { S.loreOwn += lore.techCount - S.loreSeen; S.loreSeen = lore.techCount; sendEv({ t: 'lore', n: S.loreOwn }); }   // a local find not yet counted
+            const n = Math.max(0, Math.min(99, d.n | 0)), old = S.loreOth.get(p.id) || 0;
+            S.loreOth.set(p.id, n);
+            if (n > old) { lore.techCount += n - old; S.loreSeen = lore.techCount; }
+        };
+        Matter.Events.on(engine, 'afterUpdate', guard('loreSync', () => {
+            if (typeof lore === 'undefined' || !hasPeers() || (simulation.cycle & 7)) return;
+            const c = lore.techCount | 0;
+            if (c > S.loreSeen) { S.loreOwn += c - S.loreSeen; sendEv({ t: 'lore', n: S.loreOwn }); }
+            else if (c === 0 && S.loreSeen > 0) { S.loreOwn = 0; S.loreOth.clear(); sendEv({ t: 'lore', n: 0 }); }   // a new run reset it
+            S.loreSeen = c;
+        }));
         H.pvp = (p, d) => {
             if (!S.peers.has(p.id) || !S.pvp || S.paused || !m.alive || (d.lc | 0) !== LC() || typeof m.takeDamage !== 'function' || !Number.isFinite(d.d)) return;
             if (Number.isInteger(d.q)) { if (d.q <= (p.pvpQ | 0)) return; p.pvpQ = d.q; }      // a repeated / reordered damage packet must never hurt twice
@@ -749,7 +780,7 @@
             if (!isHostPeer(p) || S.solo || d.seed == null || !Number.isFinite(Number(d.lc))) return;
             if (S.guestLoad || S.savePending && !S.isHost) return;                          // this player is loading its own save from the match file
             if (S.matchLoaded && S.inGame && LC() === (d.lc | 0)) return;                    // already on the right level with its own loadout: a rebuild would erase it
-            S.runSeed = String(d.seed); S.catchTarget = Math.max(0, d.lc | 0);
+            installLocalLevels(d.ld); S.runSeed = String(d.seed); S.catchTarget = Math.max(0, d.lc | 0);
             if (S.inGame) {
                 S.forceLv = Array.isArray(d.lv) ? d.lv.map(String).slice(0, 64) : null;
                 S.forceFlip = typeof d.fl === 'boolean' ? d.fl : null;
@@ -803,8 +834,22 @@
         };
         // A remote press must go through the level's OWN check (`if (button.isUp) { query(); if (!button.isUp) doThing() }`), otherwise levels that
         // react to a press (gravitron's flip, doors...) never run their action on this client. So a press is delivered to the next query call.
-        function applyRemoteButton(button, up, isEvent) {
+        function applyRemoteButton(button, up, isEvent, fl, cy) {
             if (!button) return;
+            if (isEvent && !up && fl !== undefined && level.isVerticalFLipLevel && Number.isFinite(cy)) {
+                if (S.lastFlipCy !== undefined && Math.abs(cy - S.lastFlipCy) <= 6) return;       // the second button of the same press (floor + ceiling pair)
+                S.lastFlipCy = cy;
+            }
+            if (isEvent && !up && fl !== undefined && level.isVerticalFLipLevel) button._mpFl = fl;
+            // a flip press that arrives while this client is still animating the previous flip must not be lost: wait for the animation to end
+            if (isEvent && !up && level.isFlipping && level.isVerticalFLipLevel && !button._mpWait) {
+                button._mpWait = true; const t0 = now();
+                const retry = () => {
+                    if (level.isFlipping && now() - t0 < 4000) { setTimeout(retry, 100); return; }
+                    button._mpWait = false; level.isFlipping = false; applyRemoteButton(button, false, true, fl); S.lastFlipCy = undefined;
+                };
+                setTimeout(retry, 100); return;
+            }
             if (up) { button._mpPending = false; button.isUp = true; return; }
             if (button._mpPending) return;                                     // a press is already waiting for the level's next check
             // only a live press EVENT counts as a press; a snapshot (level start, late join) just copies the state, it must never trigger a level action
@@ -814,7 +859,7 @@
             if (S.isHost || !isHostPeer(p) || (d.lc | 0) !== LC() || typeof d.i !== 'string' || d.i.length > 24) return;
             const state = { up: !!d.up, cy: Number.isFinite(d.cy) ? d.cy : simulation.cycle };
             S.remoteButtons.set(d.i, state);
-            applyRemoteButton(S.buttons[d.i], state.up, true);
+            applyRemoteButton(S.buttons[d.i], state.up, true, Number.isFinite(d.fl) ? d.fl : undefined, state.cy);
         };
         H.btns = (p, d) => {
             if (S.isHost || !isHostPeer(p) || (d.lc | 0) !== LC() || !Array.isArray(d.l)) return;
@@ -1004,7 +1049,7 @@
         function sendRoom(to) { sendEv({ t: 'room', pvp: S.pvp ? 1 : 0, tg: S.together ? 1 : 0, max: S.room.max, ask: S.room.ask ? 1 : 0, gun: S.room.gun ? 1 : 0, comm: communityOn() ? 1 : 0 }, to); }
         H.room = (p, d) => {
             if (!S.peers.has(p.id) || S.isHost || !isHostPeer(p)) return;                    // only the host decides the room settings
-            S.pvp = d.pvp === 1; S.together = d.tg !== 0; S.room.ask = d.ask !== 0; S.room.max = Math.max(2, Math.min(12, d.max | 0 || 8)); S.room.gun = d.gun !== 0; S.room.comm = d.comm === 1;
+            S.pvp = d.pvp === 1; S.together = true; S.room.ask = d.ask !== 0; S.room.max = Math.max(2, Math.min(12, d.max | 0 || 8)); S.room.gun = true; S.room.comm = d.comm === 1;
             ui.refresh();
         };
         H.po = (p, d) => {
@@ -1237,7 +1282,29 @@
             if (livingOthers().length === 0) { S.forceDeath = true; try { m.death(); } finally { S.forceDeath = false; S.dead = false; try { ui.banner(null); } catch (e) { } } }
         }
         // ---- level order: the host's list is authoritative (level pools / local levels may differ per player) ----
-        function lvInfo() { return { lv: Array.isArray(level.levels) ? level.levels.slice() : null, fl: !!simulation.isHorizontalFlipped, df: cleanDiff(simulation.difficultyOptions) }; }
+        // Local (level editor) levels live in one player's localStorage: ship the ones this run uses so the others can play them (kept in memory only).
+        function localLevelData(names) {
+            const out = {};
+            try {
+                if (typeof levelData === 'undefined' || !levelData.store || !Array.isArray(names)) return out;
+                for (const n of new Set(names)) if (levelData.store.has(n)) { const d = levelData.store.get(n); if (d && JSON.stringify(d).length < 400000) out[n] = d; }
+            } catch (e) { }
+            return out;
+        }
+        function installLocalLevels(ld) {
+            try {
+                if (!ld || typeof ld !== 'object' || typeof levelData === 'undefined' || !levelData.store) return;
+                levelData.store.load();
+                let n = 0;
+                for (const name of Object.keys(ld).slice(0, 16)) {
+                    if (levelData.store.has(name) || typeof level.localMaps !== 'object' || level.maps[name]) continue;     // the guest's own level of that name wins
+                    levelData.store.levels[name] = levelData.normalize({ ...ld[name], name });
+                    level.localMaps[name] = () => levelData.play(levelData.store.get(name)); n++;
+                }
+                if (n) console.log('[MP] received ' + n + ' local level(s) from the host');
+            } catch (e) { console.warn('[MP] local level install failed', e); }
+        }
+        function lvInfo() { return { ld: localLevelData(level.levels), lv: Array.isArray(level.levels) ? level.levels.slice() : null, fl: !!simulation.isHorizontalFlipped, df: cleanDiff(simulation.difficultyOptions) }; }
         function cleanDiff(o) {
             if (!o || typeof o !== 'object') return null;
             const r = {}; let n = 0;
@@ -1472,7 +1539,7 @@
             const i = button._mpButtonId, up = !!button.isUp;
             if (S.buttonSent.get(i) === up) return;
             S.buttonSent.set(i, up);
-            sendEv({ t: 'btn', lc: LC(), cy: simulation.cycle, i, up });
+            sendEv({ t: 'btn', lc: LC(), cy: simulation.cycle, i, up, fl: level.isVerticalFLipLevel ? (level.isFlipped ? 1 : 0) : undefined });
         }
         function withAllPlayersInButtonQuery(fn) {
             if (!S.isHost || !ghosts.size) return fn();
@@ -1501,7 +1568,8 @@
                 // differ between clients, which used to shift every later id.
                 const id = (button && button.min && Number.isFinite(button.min.x)) ? Math.round(button.min.x) + ':' + Math.round(button.min.y) : 'n' + (S.buttonSeq++);
                 button._mpButtonId = id;
-                if (S.buttons[id] && S.buttons[id] !== button) { S.remoteButtons.delete(id); S.buttonSent.delete(id); }   // the level rebuilt this button: forget the old object's state
+                if (S.buttons[id] && S.buttons[id] !== button) S.remoteButtons.delete(id);
+                if (S.buttons[id] !== button) S.buttonSent.delete(id);   // the level rebuilt this button: forget the old object's state
                 S.buttons[id] = button;
                 for (const method of ['query', 'queryRemove', 'queryPlayer']) {
                     const original = button[method];
@@ -1517,6 +1585,9 @@
                             this._mpPending = false;
                             if (now() - (this._mpPendingAt || 0) < 700) {                    // a press that is still fresh: the level reacts to it exactly once
                                 for (const k in S.buttons) if (S.buttons[k]) S.buttons[k]._mpPending = false;      // the other buttons of the same press (floor + ceiling pair) are the same press
+                                if (this._mpFl !== undefined && level.isVerticalFLipLevel) {         // take the host's side of the flip, whatever this client thought
+                                    level.isFlipped = !!this._mpFl; simulation.isInvertedVertical = !!this._mpFl;
+                                }
                                 this.isUp = false; return undefined;
                             }
                         }
@@ -1793,8 +1864,8 @@
                 const hostSave = valid(match.host && match.host.save) ? match.host.save : (entries[0] && entries[0].save);
                 if (!hostSave) { say('that file has no usable checkpoint'); try { alert('That file has no usable n-gon checkpoint.'); } catch (e) { } return; }
                 if (match.room && S.isHost !== false) {
-                    S.room.max = Math.max(2, Math.min(12, match.room.max | 0 || 8)); S.room.ask = match.room.ask !== false; S.room.gun = match.room.gun !== false;
-                    S.together = match.room.together !== false; S.pvp = match.room.pvp === true;
+                    S.room.max = Math.max(2, Math.min(12, match.room.max | 0 || 8)); S.room.ask = match.room.ask !== false; S.room.gun = true;
+                    S.together = true; S.pvp = match.room.pvp === true;
                     sendRoom(); ui.refresh();
                 }
                 const open = openPeers().filter(p => p.hello);
@@ -1899,6 +1970,33 @@
                     if (hasPeers() && !S.solo) sendEv({ t: 'resync', seed: S.runSeed, lc: LC(), ...lvInfo() });
                 }
             }), 250);
+        }
+        // Elevators: the host does not feel a guest's weight, so touch-started elevators never left the bottom for guests, and on the guest the
+        // rider's weight fought the host's position updates (jitter). The host now also counts remote players as "touching"; guests get a heavy platform.
+        function wrapElevators() {
+            if (typeof level === 'undefined' || typeof level.elevator !== 'function') return;
+            wrapFn(level, 'elevator', 'level.elevator', orig => function () {
+                const args = arguments;
+                const fr = args[6] && typeof args[6] === 'object' ? args[6] : { up: 0.01, down: 0.2 };
+                const who = orig.apply(this, args);
+                try {
+                    if (who && typeof who.moveOnTouch === 'function') {
+                        const mt = who.moveOnTouch;
+                        who.moveOnTouch = function (isOn) {
+                            const r = mt.apply(this, arguments);
+                            if (S.isHost && hasPeers() && !this.isUp && isOn !== false && this.position.y >= (args[1] + args[3] / 2) - 1) {
+                                for (const g of ghosts.values()) {
+                                    const pp = S.peers.get(g.gid);
+                                    if (pp && pp.alive && !pp.dead && Matter.Query.collides(this, [g]).length) { this.isUp = true; this.frictionAir = fr.up; break; }
+                                }
+                            }
+                            return r;
+                        };
+                    }
+                    if (!S.isHost && hasPeers() && !S.solo && who && who.mass) Matter.Body.setDensity(who, who.density * 40);
+                } catch (e) { }
+                return who;
+            });
         }
         function wrapNewFeatures() {
             if (typeof levelEditor !== 'undefined' && levelEditor) {
@@ -2694,6 +2792,8 @@
                 ctx.fillStyle = 'rgba(100,100,100,0.4)'; ctx.fillRect(s.x - w / 2, s.y - 55, w, 6);
                 ctx.fillStyle = 'rgba(255,0,0,0.75)'; ctx.fillRect(s.x - w / 2, s.y - 55, w * hp, 6);
                 { const lbl = pp.name + (pz ? ' (paused)' : ''); ctx.font = 'bold 26px Arial'; ctx.textAlign = 'center'; ctx.lineJoin = 'round'; ctx.lineWidth = 6; ctx.strokeStyle = 'rgba(255,255,255,0.92)'; ctx.strokeText(lbl, s.x, s.y - 78); ctx.fillStyle = '#111'; ctx.fillText(lbl, s.x, s.y - 78); }
+                if (pp.bubble && !drawBubble(pp.bubble.t, s.x, s.y - 118, pp.bubble.at)) pp.bubble = null;
+                if (S.myBubble && S._bubCycle !== simulation.cycle) { S._bubCycle = simulation.cycle; if (!drawBubble(S.myBubble.t, m.pos.x, m.pos.y - 118, S.myBubble.at)) S.myBubble = null; }
                 ctx.restore();
                 if (!pz) drawVm(pp);
             });
@@ -2974,6 +3074,37 @@
         setInterval(tick, CFG.tickMs);
 
         // ------------------------------------------------------------------ chat + UI
+
+        // chat bubbles + bottom-left log
+        const CHAT_MS = 6000;
+        function drawBubble(text, x, y, born) {
+            const age = now() - born; if (age > CHAT_MS) return false;
+            const a = age > CHAT_MS - 800 ? Math.max(0, (CHAT_MS - age) / 800) : 1;
+            ctx.save(); ctx.globalAlpha = a; ctx.font = '18px Arial'; ctx.textAlign = 'center';
+            const words = String(text).split(' '), lines = []; let cur = '';
+            for (const w of words) { if (ctx.measureText(cur + ' ' + w).width > 260 && cur) { lines.push(cur); cur = w; } else cur = cur ? cur + ' ' + w : w; }
+            lines.push(cur);
+            const lh = 22, w = Math.min(280, Math.max(...lines.map(l => ctx.measureText(l).width)) + 18), h = lines.length * lh + 10;
+            const top = y - h;
+            ctx.fillStyle = 'rgba(255,255,255,0.92)'; ctx.strokeStyle = 'rgba(0,0,0,0.55)'; ctx.lineWidth = 2;
+            ctx.beginPath(); ctx.rect(x - w / 2, top, w, h); ctx.fill(); ctx.stroke();
+            ctx.beginPath(); ctx.moveTo(x - 7, y); ctx.lineTo(x, y + 9); ctx.lineTo(x + 7, y); ctx.closePath(); ctx.fill(); ctx.stroke();
+            ctx.fillStyle = '#111'; lines.forEach((l, i) => ctx.fillText(l, x, top + 21 + i * lh));
+            ctx.restore(); return true;
+        }
+        const chatLog = (() => {
+            const el = document.createElement('div');
+            el.style.cssText = 'position:fixed;left:10px;bottom:10px;z-index:9000;max-width:min(420px,60vw);pointer-events:none;font:14px/1.3 Arial,sans-serif;color:#fff;text-shadow:0 0 3px #000,0 0 3px #000';
+            document.body.appendChild(el); return el;
+        })();
+        function chatShow(name, text) {
+            const row = document.createElement('div');
+            row.style.cssText = 'padding:3px 8px;margin-top:3px;background:rgba(0,0,0,0.5);border-radius:4px;transition:opacity .6s';
+            const b = document.createElement('b'); b.textContent = name + ': '; row.appendChild(b); row.appendChild(document.createTextNode(text));
+            chatLog.appendChild(row);
+            while (chatLog.children.length > 6) chatLog.firstChild.remove();
+            setTimeout(() => { row.style.opacity = '0'; setTimeout(() => row.remove(), 700); }, 12000);
+        }
         function say(text, isHtml) {
             const msg = isHtml ? text : esc(text);
             try { if (simulation.inGameConsole) simulation.inGameConsole(msg); else console.log('[MP]', text); } catch (e) { }
@@ -3008,6 +3139,8 @@
 #mp-panel .pl .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:bold}
 #mp-panel .pl .sub{font-size:12px;color:#c4ccd7;font-weight:normal}
 #mp-panel .muted{color:#c4ccd7;font-size:13px}
+#mp-panel .pill{font-size:12px;font-weight:normal;background:#2c3644;border:1px solid #556070;border-radius:10px;padding:1px 8px;max-width:60%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#mp-panel .sec{margin:10px 0 4px;padding-top:6px;color:#9fb1c8;font-size:12px;text-transform:uppercase;letter-spacing:.06em}
 #mp-panel .dot{width:8px;height:8px;border-radius:50%;background:#3a3;flex:none}
 #multiplayer-details>summary{cursor:pointer;pointer-events:auto}
 @media(max-width:600px){#mp-panel{max-height:45vh}}
@@ -3036,39 +3169,37 @@
             }
 
             const h = mk('h3', '', panel);
-            mk('span', 'Online players', h);
+            mk('span', 'Multiplayer', h);
+            const st = mk('span', 'connecting...', h, 'pill');
             const nr = mk('div', '', panel, 'r');
-            mk('span', 'Your name', nr);
+            mk('span', 'Name', nr);
             const topName = mk('input', '', nr);
             topName.type = 'text'; topName.maxLength = 20; topName.value = S.baseName; topName.placeholder = 'username';
-            const me = mk('div', '', panel, 'muted');
+            const me = mk('div', '', panel, 'muted'); me.style.display = 'none';
+            mk('div', 'Players', panel, 'sec');
             const list = mk('div', '', panel);
             mk('div', 'Room settings', panel, 'sec');
             const rs = mk('div', '', panel, 'muted'); rs.style.display = 'none';
-            const r = mk('div', '', panel, 'r');
-            const t1 = mk('label', '', r);
-            const tcb = mk('input', '', t1); tcb.type = 'checkbox'; tcb.checked = S.together;
-            mk('span', ' stay together', t1);
-            const t2 = mk('label', '', r);
-            const pcb = mk('input', '', t2); pcb.type = 'checkbox'; pcb.checked = S.pvp;
-            mk('span', ' pvp', t2);
             const r2 = mk('div', '', panel, 'r');
             const t3 = mk('label', '', r2);
-            const acb = mk('input', '', t3); acb.type = 'checkbox'; acb.checked = S.room.ask;
-            mk('span', ' ask me before players join', t3);
-            const t4 = mk('label', '', r2);
-            mk('span', 'max players ', t4);
+            const ocb = mk('input', '', t3); ocb.type = 'checkbox'; ocb.checked = !S.room.ask;
+            mk('span', ' open party (anyone can join)', t3);
+            const t2 = mk('label', '', r2);
+            const pcb = mk('input', '', t2); pcb.type = 'checkbox'; pcb.checked = S.pvp;
+            mk('span', ' pvp', t2);
+            const r1 = mk('div', '', panel, 'r');
+            const t4 = mk('label', '', r1);
+            mk('span', 'Max players ', t4);
             const msel = mk('select', '', t4);
             for (let n = 2; n <= 12; n++) { const o = mk('option', String(n), msel); o.value = String(n); }
             msel.value = String(S.room.max);
-            const r3 = mk('div', '', panel, 'r');
-            const t5 = mk('label', '', r3);
-            const gcb = mk('input', '', t5); gcb.type = 'checkbox'; gcb.checked = S.room.gun;
-            mk('span', ' everyone starts with a gun', t5);
+            const r4 = mk('div', '', panel, 'r');
+            const t6 = mk('label', '', r4);
+            const ccb = mk('input', '', t6); ccb.type = 'checkbox'; ccb.checked = communityOn();
+            mk('span', " include community maps", t6);
             mk('div', 'Match', panel, 'sec');
             const mr = mk('div', '', panel, 'r');
             const bExit = mk('button', 'Exit match...', mr); bExit.onclick = () => exitMatch();
-            const bSave = mk('button', 'Save match to file', mr); bSave.onclick = () => saveMatchNow();
             const bLoad = mk('button', 'Load saved match...', mr);
             const fIn = mk('input', '', mr); fIn.type = 'file'; fIn.accept = '.json,application/json'; fIn.style.display = 'none';
             bLoad.onclick = () => fIn.click();
@@ -3076,32 +3207,46 @@
             const matchSync = () => {
                 const hostish = S.isHost || !hasPeers();
                 bExit.style.display = S.inGame ? '' : 'none';
-                bSave.style.display = S.inGame && hostish ? '' : 'none';
                 bLoad.style.display = !S.inGame && hostish ? '' : 'none';
+                mr.style.display = (S.inGame || hostish) ? '' : 'none';
+                pauseSave();
             };
-            const r4 = mk('div', '', panel, 'r');
-            const t6 = mk('label', '', r4);
-            const ccb = mk('input', '', t6); ccb.type = 'checkbox'; ccb.checked = communityOn();
-            mk('span', ' include community maps (host\'s level pool)', t6);
-            const st = mk('div', 'Status: ...', panel, 'muted');
+            // host-only "Save match to file" button inside n-gon's pause menu
+            const pauseSave = () => {
+                const el = document.getElementById('pause-grid-left');
+                if (!el) return;
+                const old = el.querySelector('#mp-pause-save');
+                const want = S.inGame && (S.isHost || !hasPeers());
+                if (!want) { if (old) old.remove(); return; }
+                if (old) return;
+                const box = document.createElement('div');
+                box.id = 'mp-pause-save'; box.className = 'pause-grid-module';
+                const btn = document.createElement('button');
+                btn.textContent = 'Save multiplayer match to file';
+                btn.style.cssText = 'width:100%;padding:8px;font-size:15px;cursor:pointer;';
+                btn.onclick = () => saveMatchNow();
+                box.appendChild(btn);
+                el.insertBefore(box, el.children[1] || null);
+            };
+            try { const pg = document.getElementById('pause-grid-left'); if (pg) new MutationObserver(() => { if (!pg.querySelector('#mp-pause-save')) pauseSave(); }).observe(pg, { childList: true }); } catch (e) { }
             const roomEditable = () => S.isHost || !hasPeers();
             const roomChanged = () => {
                 if (!roomEditable()) { syncRoom(); return; }
-                S.together = tcb.checked; S.pvp = pcb.checked; S.room.ask = acb.checked; S.room.max = Math.max(2, Math.min(12, +msel.value || 8)); S.room.gun = gcb.checked;
+                S.together = true; S.room.gun = true;
+                S.pvp = pcb.checked; S.room.ask = !ocb.checked; S.room.max = Math.max(2, Math.min(12, +msel.value || 8));
                 sendRoom();
                 syncRoom();
             };
-            tcb.onchange = pcb.onchange = acb.onchange = msel.onchange = gcb.onchange = roomChanged;
+            pcb.onchange = ocb.onchange = msel.onchange = roomChanged;
             ccb.onchange = () => { if (roomEditable() && !S.inGame) { setCommunity(ccb.checked); sendRoom(); } syncRoom(); };
             function syncRoom() {                                       // show the real values
                 matchSync();
                 ccb.checked = (S.isHost || !hasPeers()) ? communityOn() : !!S.room.comm;
-                gcb.checked = !!S.room.gun; tcb.checked = !!S.together; pcb.checked = !!S.pvp; acb.checked = !!S.room.ask; msel.value = String(S.room.max);
+                pcb.checked = !!S.pvp; ocb.checked = !S.room.ask; msel.value = String(S.room.max);
                 const ed = roomEditable();
-                tcb.disabled = pcb.disabled = acb.disabled = msel.disabled = gcb.disabled = !ed; ccb.disabled = !ed || S.inGame;
-                let info = ed ? 'You are the host: these settings apply to everyone.' : 'Set by the host - you cannot change them.';
-                try { info += ' Seed ' + getSeed() + ' - difficulty ' + (simulation.difficultyMode != null ? ['easy', 'normal', 'hard', 'why'][simulation.difficultyMode] || simulation.difficultyMode : '?') + (simulation.isCommunityMaps ? ' - community maps' : ''); } catch (e) { }
-                rs.textContent = info;
+                pcb.disabled = ocb.disabled = msel.disabled = !ed; ccb.disabled = !ed || S.inGame;
+                rs.textContent = ed ? '' : 'Set by the host.';
+                rs.style.display = ed ? 'none' : '';
             }
 
             // the name applies by itself shortly after typing stops (no Set button)
@@ -3157,8 +3302,8 @@
             function refresh() {
                 syncRoom();
                 const open = openPeers();
-                const people = S.id ? (open.length ? 'connected to ' + open.map(p => p.name).join(', ') + ' (' + (open.length + 1) + ' players, you are the ' + (S.isHost ? 'host' : 'client') + ')' : 'not connected to anyone yet') : 'connecting...';
-                st.textContent = 'Status: ' + people;
+                const people = S.id ? (open.length ? (S.isHost ? 'hosting ' : 'joined ') + (open.length + 1) + ' players' : 'online') : 'connecting...';
+                st.textContent = people; st.title = people;
                 refreshDir();
             }
             const bannerEl = mk('div', '', document.body);
@@ -3183,7 +3328,7 @@
                     me.textContent = ''; me.style.display = 'none';
                     if (document.activeElement !== topName) topName.value = S.baseName;
                 },
-                status(s) { st.textContent = 'Status: ' + s; },
+                status(s) { st.textContent = s; st.title = s; },
                 notify, banner, refresh, refreshDir
             };
         })();
@@ -3191,14 +3336,14 @@
         // chat: Enter opens a box
         (function () {
             const inp = document.createElement('input'); inp.maxLength = 200; inp.placeholder = 'chat (Enter to send, Esc to cancel)';
-            inp.style.cssText = 'display:none;position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);width:min(70vw,800px);z-index:9999;padding:10px;font-size:16px;background:#e8e8e8cf;border:0;';
+            inp.style.cssText = 'display:none;position:fixed;left:10px;bottom:10px;width:min(420px,60vw);z-index:9999;padding:10px;font-size:16px;background:#e8e8e8cf;border:0;';
             document.body.appendChild(inp);
             let open = false;
             const close = () => { open = false; inp.style.display = 'none'; inp.blur(); };
             document.addEventListener('keydown', e => {
                 if (open) {
                     e.stopPropagation();
-                    if (e.key === 'Enter') { const t = inp.value.trim(); if (t) { sendEv({ t: 'chat', x: t }); say(esc(S.name) + ': ' + esc(t), true); } close(); e.preventDefault(); }
+                    if (e.key === 'Enter') { const t = inp.value.trim(); if (t) { sendEv({ t: 'chat', x: t }); S.myBubble = { t, at: now() }; chatShow(S.name, t); } close(); e.preventDefault(); }
                     else if (e.key === 'Escape') { close(); e.preventDefault(); }
                     return;
                 }
@@ -3227,6 +3372,7 @@
         const recordOwnSpawn = guard('po.record', (name, before) => {
             if (powerUp.length <= before || S.dropCtx > 0 || S.replayDrop || S.netCtx > 0 || S.levelPhase > 0 || S.mobPhase > 0) return;
             if (!S.inGame || S.loading || S.solo || S.applying || S.dead || !hasPeers() || ownPuQ.length > 60) return;
+            if (simulation.cycle - (S.levelStartCycle | 0) < 150) return;        // the level's starting pickups are personal: everybody already spawns their own set, mirroring them showed two guns / two sets
             const pu = powerUp[powerUp.length - 1];
             if (pu && pu.position) ownPuQ.push([String(name), q(pu.position.x), q(pu.position.y), q(pu.size)]);
         });
@@ -3246,6 +3392,7 @@
         wrapPopulateLevels();
         wrapLevelFrameRandom();
         wrapNewFeatures();
+        wrapElevators();
         // every player gets their OWN random gun / field / tech choices (n-gon's seeded generator would otherwise offer the same ones to everybody)
         for (const k of ['gun', 'field', 'tech']) {
             if (typeof powerUps !== 'undefined' && powerUps[k]) wrapFn(powerUps[k], 'effect', 'powerUps.' + k + '.effect', orig => function () {
@@ -3429,7 +3576,7 @@
         installVisualMirror();
         startPeer(S.baseName);
         window.ngonMP = {
-            VM, S, peers: S.peers, dir, ghosts, mobMap, connect: connectTo, join: joinByName, rename: startPeer, hooks: HOOKS,
+            VM, S, H, peers: S.peers, dir, ghosts, mobMap, connect: connectTo, join: joinByName, rename: startPeer, hooks: HOOKS,
             diag() {   // paste the output of ngonMP.diag() if something does not sync in your n-gon build
                 const g = n => { try { return (0, eval)('typeof ' + n); } catch (e) { return 'error'; } };
                 const o = {
