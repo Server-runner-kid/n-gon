@@ -1,5 +1,5 @@
 /*
- * n-gon multiplayer v10-Q (title-screen lobby play, community-maps option; v10-L: exit match, save and load whole matches, timers survive title return; v10-K: attack timing, hit particles, single corpse, own choices, companions, host-only start; v10-J: cloak flash, blend modes, host-authoritative difficulty, guest experiment scroll; spectator camera, gravity-flip buttons, host room settings, panel UI; triangle bullets sent as real polygons; flash frames, shared self-spawned pickups, experimental ready gate, 9 KB packet budget, hashed mob roster; spectators removed from the world, real skins mirrored, no duplicate mob-death visuals, touch-to-claim blocks; F stability: packet validation/rate limits/chunking, pruning, invalid-body cleanup; visual mirror, guest mob effects, printed flag, real bullet shapes, cloak fix, spectators non-solid, pilot wave claim, shared experimental mode) / v9-E  (v9-D + match management: host-authoritative level changes, reconnect/late-join parity, duplicate-connection fix, training isolation; combat sync: duplicate-damage guards, mirrored explosions, bullets on the ghost time base, field/immunity visuals; elimination + revival; ordered snapshots; world sync fixes; permission-based joins)
+ * n-gon multiplayer v10-R (connection fixes: one-way visibility heartbeat + reliable fallback, adaptive smoothing, 30 Hz; v10-Q: title-screen lobby play, community-maps option; v10-L: exit match, save and load whole matches, timers survive title return; v10-K: attack timing, hit particles, single corpse, own choices, companions, host-only start; v10-J: cloak flash, blend modes, host-authoritative difficulty, guest experiment scroll; spectator camera, gravity-flip buttons, host room settings, panel UI; triangle bullets sent as real polygons; flash frames, shared self-spawned pickups, experimental ready gate, 9 KB packet budget, hashed mob roster; spectators removed from the world, real skins mirrored, no duplicate mob-death visuals, touch-to-claim blocks; F stability: packet validation/rate limits/chunking, pruning, invalid-body cleanup; visual mirror, guest mob effects, printed flag, real bullet shapes, cloak fix, spectators non-solid, pilot wave claim, shared experimental mode) / v9-E  (v9-D + match management: host-authoritative level changes, reconnect/late-join parity, duplicate-connection fix, training isolation; combat sync: duplicate-damage guards, mirrored explosions, bullets on the ghost time base, field/immunity visuals; elimination + revival; ordered snapshots; world sync fixes; permission-based joins)
  *
  * Design
  *  - Every client runs its OWN player, guns, techs and fields with the game's normal code.
@@ -59,8 +59,8 @@
 
     const DEBUG = false;
     const CFG = {
-        tickMs: 50,          // network send rate (20 Hz)
-        interpMs: 100,       // render delay for interpolation
+        tickMs: 33,          // network send rate (~30 Hz)
+        interpMs: 100,       // render delay for interpolation; adapts to the measured connection jitter (see adaptInterp)
         maxBullets: 150,
         pvpScale: 0.01,
         syncCycle: true,     // keep simulation.cycle close to the host (moving platforms etc.)
@@ -525,7 +525,7 @@
             }
             p[slot] = c;
             c.on('open', () => { c._was = true; });
-            c.on('data', d => { if (p[slot] !== c || S.peers.get(pid) !== p) return; onDataSafe(p, d); });   // stale / replaced connection or removed peer
+            c.on('data', d => { if (S.peers.get(pid) !== p || !c.open) return; onDataSafe(p, d); });   // any live connection of a peer counts (the packet sequence numbers drop duplicates), so a duplicate-resolution mismatch can no longer make one side deaf
             c.on('close', () => { if (S.tearing) return; if (p[slot] === c) { p[slot] = null; if (slot === 'ev') dropPeer(p); } });
             c.on('error', () => {
                 if (S.tearing || p[slot] !== c) return;
@@ -534,6 +534,7 @@
             });
             const opened = () => {
                 if (slot === 'ev') {
+                    p.openAt = now();
                     const timer = reconnectTimers.get(pid); if (timer) clearTimeout(timer);
                     reconnectTimers.delete(pid); reconnectAttempts.delete(pid);
                     sendHello(p);
@@ -566,7 +567,7 @@
         }
         function sendSt(msg) {
             for (const p of S.peers.values()) {
-                const c = (p.st && p.st.open) ? p.st : ((p.ev && p.ev.open) ? p.ev : null);
+                const c = (!p.forceEv && p.st && p.st.open) ? p.st : ((p.ev && p.ev.open) ? p.ev : null);
                 if (c) { try { c.send(msg); } catch (e) { } }
             }
         }
@@ -1080,6 +1081,8 @@
             if (Number.isFinite(d.ts)) {
                 const diff = recv - d.ts;
                 p.offMin = (p.offMin == null) ? diff : Math.min(p.offMin + 0.5, diff);      // follows the fastest path, slowly lets go of old minima
+                const dev = Math.max(0, diff - p.offMin);                                   // how much later than the fastest packet this one came
+                p.jmax = Math.max(dev, (p.jmax || 0) * 0.992); p.jit = (p.jit || 0) * 0.9 + dev * 0.1; p.pktAt = recv;
                 st = d.ts + p.offMin;
                 st = Math.min(st, recv);
                 if (p.lastRecvT && st <= p.lastRecvT) st = p.lastRecvT + 0.1;
@@ -1088,10 +1091,11 @@
             const a = d.p;
             if (Array.isArray(a) && a.length >= 16 && a.slice(0, 16).every(Number.isFinite)) {
                 const wasPaused = p.paused;
+                if (a.length > 16) p.dead = !!a[16];     // the state packet is the truth: a lost dead/revived event used to hide a player for good
                 p.alive = !!a[5]; p.pvp = !!a[12]; p.mhp = Math.max(0.0001, Math.min(1e6, a[11] / 1000)); p.hp = Math.max(0, Math.min(p.mhp, a[10] / 1000)); p.og = !!a[13]; p.fm = a[7]; p.yOff = a[14]; p.paused = !!a[15]; p.dead = a[16] === 1; p.fa = a[17] === 1; p.imm = a[18] === 1; p.fr = Number.isFinite(a[19]) ? Math.max(0, Math.min(400, a[19])) : 0;
                 if (p.paused && !wasPaused) p.pausedAt = now();
                 p.buf.push({ t: st, x: a[0], y: a[1], vx: a[2] / 100, vy: a[3] / 100, a: a[4] / 1000 });
-                if (p.buf.length > 10) p.buf.shift();
+                if (p.buf.length > 24) p.buf.shift();
             }
             // Bullet snapshots are visual-only. Reject malformed/oversized arrays before drawing.
             p.blT = st; p.bl = (d.lc === LC() && Array.isArray(d.bl)) ? d.bl.slice(0, CFG.maxBullets * 8).map(v => Number.isFinite(v) ? v : 0) : null;
@@ -1101,7 +1105,7 @@
             p.bp = (d.lc === LC() && Array.isArray(d.bp) && d.bp.length < 2500) ? d.bp.map(v => Number.isFinite(v) ? v : 0) : null;
             // short history of what this player's attacks looked like, so they are drawn at the same moment as the (delayed) ghost: a new bullet
             // then appears at the muzzle instead of being extrapolated backwards behind the shooter
-            { const h = p.hist || (p.hist = []); h.push({ t: st, bl: p.bl, bp: p.bp, vm: p.vm }); while (h.length > 14 || (h.length > 2 && h[0].t < st - 900)) h.shift(); }
+            { const h = p.hist || (p.hist = []); h.push({ t: st, bl: p.bl, bp: p.bp, vm: p.vm }); while (h.length > 30 || (h.length > 2 && h[0].t < st - 1600)) h.shift(); }
             const fromHost = isHostPeer(p);
             if (d.cy != null && fromHost && !S.isHost && !p.paused) S.hostCy = { cy: Number(d.cy), t: now(), lc: p.lc, fi: d.fi };
             if (p.lc !== LC() || S.loading) return;
@@ -3176,6 +3180,47 @@
             for (const [k, v] of dmgOut) if (!v) dmgOut.delete(k);
             if (dir.size > 200) { const keep = [...dir].slice(-200); dir.clear(); for (const [k, v] of keep) dir.set(k, v); }
         }
+
+        // ---- connection health: "do you hear me?" feedback so a one-way link (A sees B, B does not see A) is found and repaired within seconds
+        H.hb = (p, d) => {
+            p.hbAt = now(); p.theirLc = d.lc | 0;
+            const r = d.rx && typeof d.rx === 'object' ? d.rx[S.id] : undefined;
+            p.theyHear = Number.isFinite(r) ? r : null;                       // ms since they last received a state packet from us (null: never)
+        };
+        function sendHeartbeat() {
+            const rx = {}, t = now();
+            for (const p of S.peers.values()) rx[p.id] = p.pktAt ? Math.round(t - p.pktAt) : null;
+            sendEv({ t: 'hb', lc: LC(), rx });
+        }
+        function watchLinks() {
+            const t = now();
+            for (const p of S.peers.values()) {
+                if (!p.ev || !p.ev.open || p.hbAt === undefined || t - p.hbAt > 4000) continue;
+                const deaf = p.theyHear === null ? (t - (p.openAt || t) > 4000) : (p.theyHear > 2500 && !S.paused && !p.paused);
+                if (deaf && S.inGame && !S.loading) {
+                    if (!p.forceEv) { p.forceEv = true; p.forceAt = t; console.warn('[MP] ' + p.name + ' is not receiving our state packets - switching to the reliable channel'); }
+                    if (t - (p.redialAt || 0) > 10000) {                               // and try to rebuild the fast channel
+                        p.redialAt = t;
+                        try { if (p.st) { const old = p.st; p.st = null; old.close(); } attach(peer.connect(p.id, { label: 'st', reliable: false }), true); } catch (e) { }
+                    }
+                } else if (p.forceEv && t - (p.forceAt || 0) > 60000) {
+                    p.forceEv = false;                                              // try the fast channel again; if it is still deaf this switches back within seconds
+                }
+                // the other side is on another level than we are and the difference does not heal: the host re-sends the level list
+                if (S.isHost && S.inGame && !S.loading && p.hello && p.theirLc !== LC() && p.lc !== LC()) {
+                    p.lcBadSince = p.lcBadSince || t;
+                    if (t - p.lcBadSince > 5000 && t - (p.resyncAt || 0) > 15000) { p.resyncAt = t; sendEv({ t: 'resync', seed: S.runSeed, lc: LC(), ...lvInfo() }, p.id); }
+                } else p.lcBadSince = 0;
+            }
+        }
+        // adaptive render delay: enough buffer to ride out the connection's jitter, no more (less delay = tighter feel)
+        function adaptInterp() {
+            let need = 0;
+            for (const p of S.peers.values()) if (p.ev && p.ev.open && p.jmax !== undefined) need = Math.max(need, p.jmax);
+            const target = Math.max(80, Math.min(400, CFG.tickMs * 1.6 + need * 1.15));
+            if (target > CFG.interpMs) CFG.interpMs = Math.min(target, CFG.interpMs + 20);    // more jitter: grow quickly, before it shows as stutter
+            else CFG.interpMs = Math.max(target, CFG.interpMs - 1.5);                          // calmer: shrink slowly so nothing visibly speeds up
+        }
         function tick() {
             S.tickN++;
             try {
@@ -3190,6 +3235,8 @@
                 maintainGhosts(); checkMc(); runCatchup();
                 if (S.tickN % 150 === 0) pruneState();
                 if (!hasPeers()) { opsQ = []; dropQ = []; ownPuQ = []; spawnQ = []; deathQ = []; dmgOut.clear(); pvpOut.clear(); mfxQ = []; impOut.clear(); scanWorld(); return; }
+                if (S.tickN % 20 === 0) { sendHeartbeat(); watchLinks(); }
+                if (S.tickN % 6 === 0) adaptInterp();
                 syncCycle();
                 scanWorld(); flush(); sendState();
                 if (S.isHost && hasPeers() && !S.paused) {
